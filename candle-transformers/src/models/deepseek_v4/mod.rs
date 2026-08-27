@@ -9,11 +9,13 @@
 //! per-layer compression rate and RoPE type (main layers use `rope_theta`,
 //! compressor layers use `compress_rope_theta` with Yarn scaling).
 
-use super::deepseek2::{BincountOp, NonZeroOp, TopKLastDimOp};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
+
+/// DeepSeek-V4 fp8/fp4 quantized weight loading + CPU/disk offload.
+pub mod quantized;
 
 /// Per-layer attention type used by DeepSeek-V4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1435,26 +1437,156 @@ impl DeepseekV4HCACompressor {
     }
 }
 
-/// Shared-experts MLP (`DeepseekV4MLP`): gate/up/down linear layers with swiGLU
-/// clamps matching `modeling_deepseek_v4.py` (`gate.clamp(max=limit)`,
-/// `up.clamp(min=-limit, max=limit)`).
-pub struct DeepseekV4Mlp {
+/// Manifold-Constrained Hyper-Connections (mHC) mixer (paper §2.2, eq. 8;
+/// `DeepseekV4HyperConnection` in `modeling_deepseek_v4.py`).
+///
+/// Owns the learned `fn` / `base` / `scale` parameters that turn the incoming
+/// `hc_mult` parallel residual streams (shape `[B, S, hc_mult, D]`) into three
+/// sets of weights: `pre` (stream-collapse weights for the sublayer input),
+/// `post` (block-output placement, range `[0, 2]`) and `comb` (an `H×H` stream
+/// mixer, Sinkhorn-projected onto the doubly-stochastic manifold).
+pub struct DeepseekV4HyperConnection {
+    hc_mult: usize,
+    hc_sinkhorn_iters: usize,
+    hc_eps: f64,
+    input_norm: UnweightedRMSNorm,
+    fn_: Tensor,
+    base: Tensor,
+    scale: Tensor,
+}
+
+impl DeepseekV4HyperConnection {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let hc = cfg.hc_mult;
+        let mix = (2 + hc) * hc;
+        let fn_ = vb.get((mix, hc * cfg.hidden_size), "fn")?;
+        let base = vb.get((mix,), "base")?;
+        let scale = vb.get((3,), "scale")?;
+        Ok(Self {
+            hc_mult: hc,
+            hc_sinkhorn_iters: cfg.hc_sinkhorn_iters,
+            hc_eps: cfg.hc_eps,
+            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps),
+            fn_,
+            base,
+            scale,
+        })
+    }
+
+    /// Compute `pre`, `post`, `comb` from the mHC mapping (paper §2.2 eq. 8)
+    /// and the collapsed single sequence fed into the sublayer.
+    ///
+    /// Returns `(post [B,S,H], comb [B,S,H,H], collapsed [B,S,D])`.
+    pub fn forward(&self, hidden_streams: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let hc = self.hc_mult;
+        // Flatten streams to [B, S, H*D] and run the unweighted RMS norm in f32.
+        let flat = self
+            .input_norm
+            .forward(&hidden_streams.flatten_from(2)?.to_dtype(DType::F32)?)?;
+        // F.linear(flat, fn) = flat @ fn^T (flattened to 2D for matmul).
+        let (b, sl, k) = flat.dims3()?;
+        let lin = flat
+            .reshape((b * sl, k))?
+            .matmul(&self.fn_.t()?)?
+            .reshape((b, sl, (2 + hc) * hc))?; // [B, S, (2+H)*H]
+        let pre_w = lin.narrow(D::Minus1, 0, hc)?;
+        let post_w = lin.narrow(D::Minus1, hc, hc)?;
+        let comb_w = lin.narrow(D::Minus1, 2 * hc, hc * hc)?;
+        let pre_b = self.base.narrow(0, 0, hc)?;
+        let post_b = self.base.narrow(0, hc, hc)?;
+        let comb_b = self.base.narrow(0, 2 * hc, hc * hc)?;
+        let s = self.scale.to_vec1::<f32>()?;
+        let (pre_scale, post_scale, comb_scale) = (s[0] as f64, s[1] as f64, s[2] as f64);
+
+        let pre =
+            (candle_nn::ops::sigmoid(&(pre_w * pre_scale)?.broadcast_add(&pre_b)?)? + self.hc_eps)?;
+        let post =
+            (candle_nn::ops::sigmoid(&(post_w * post_scale)?.broadcast_add(&post_b)?)? * 2.0)?;
+
+        let comb_logits = {
+            let (b, s_len, _) = lin.dims3()?;
+            let cw = comb_w.reshape((b, s_len, hc, hc))?;
+            let cb = comb_b.reshape((hc, hc))?;
+            (cw * comb_scale)?.broadcast_add(&cb)?
+        };
+        let comb = sinkhorn(&comb_logits, self.hc_eps, self.hc_sinkhorn_iters)?; // [B,S,H,H]
+
+        // Collapse the hc_mult streams into a single sequence with the `pre` weights.
+        let collapsed = pre
+            .unsqueeze(D::Minus1)?
+            .broadcast_mul(hidden_streams)?
+            .sum(D::Minus2)?
+            .to_dtype(hidden_streams.dtype())?;
+        Ok((post, comb, collapsed))
+    }
+}
+
+/// Final HC-stream collapse (paper §2.2; `DeepseekV4HyperHead`). Reduces the
+/// `hc_mult` residual streams down to a single sequence with per-stream
+/// sigmoid-gated weights before the shared final RMSNorm.
+pub struct DeepseekV4HyperHead {
+    hc_eps: f64,
+    input_norm: UnweightedRMSNorm,
+    hc_fn: Tensor,
+    hc_base: Tensor,
+    hc_scale: Tensor,
+}
+
+impl DeepseekV4HyperHead {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let hc = cfg.hc_mult;
+        let hc_fn = vb.get((hc, hc * cfg.hidden_size), "hc_fn")?;
+        let hc_base = vb.get((hc,), "hc_base")?;
+        let hc_scale = vb.get((1,), "hc_scale")?;
+        Ok(Self {
+            hc_eps: cfg.hc_eps,
+            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps),
+            hc_fn,
+            hc_base,
+            hc_scale,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let flat = self
+            .input_norm
+            .forward(&x.flatten_from(2)?.to_dtype(DType::F32)?)?;
+        let (b, sl, k) = flat.dims3()?;
+        let mixes = flat
+            .reshape((b * sl, k))?
+            .matmul(&self.hc_fn.t()?)?
+            .reshape((b, sl, self.hc_fn.dim(0)?))?; // [B,S,H]
+        let scale = self.hc_scale.to_vec1::<f32>()?[0] as f64;
+        let pre = (candle_nn::ops::sigmoid(&(mixes * scale)?.broadcast_add(&self.hc_base)?)?
+            + self.hc_eps)?;
+        pre.unsqueeze(D::Minus1)?
+            .broadcast_mul(x)?
+            .sum(D::Minus2)?
+            .to_dtype(x.dtype())
+    }
+}
+
+/// Shared-expert MLP (`DeepseekV4MLP`): gate/up/down with SiLU and the
+/// `swiglu_limit` clamp. Uses `moe_intermediate_size` as the hidden width (the
+/// tiny config carries no separate dense `intermediate_size`).
+pub struct DeepseekV4MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act: Activation,
     limit: f64,
 }
 
-impl DeepseekV4Mlp {
+impl DeepseekV4MLP {
     pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let h = cfg.hidden_size;
-        let int = cfg.moe_intermediate_size;
+        let inter = cfg.moe_intermediate_size;
+        let hidden = cfg.hidden_size;
+        let gate_proj = candle_nn::linear_no_bias(hidden, inter, vb.pp("gate_proj"))?;
+        let up_proj = candle_nn::linear_no_bias(hidden, inter, vb.pp("up_proj"))?;
+        let down_proj = candle_nn::linear_no_bias(inter, hidden, vb.pp("down_proj"))?;
         Ok(Self {
-            gate_proj: candle_nn::linear_b(h, int, cfg.mlp_bias, vb.pp("gate_proj"))?,
-            up_proj: candle_nn::linear_b(h, int, cfg.mlp_bias, vb.pp("up_proj"))?,
-            down_proj: candle_nn::linear_b(int, h, cfg.mlp_bias, vb.pp("down_proj"))?,
-            act: cfg.hidden_act,
+            gate_proj,
+            up_proj,
+            down_proj,
             limit: cfg.swiglu_limit,
         })
     }
@@ -1465,117 +1597,109 @@ impl DeepseekV4Mlp {
             .forward(x)?
             .clamp(f64::NEG_INFINITY, self.limit)?;
         let up = self.up_proj.forward(x)?.clamp(-self.limit, self.limit)?;
-        self.down_proj.forward(&(&self.act.forward(&gate)? * &up)?)
+        let act = (candle_nn::ops::silu(&gate)? * up)?;
+        self.down_proj.forward(&act)
     }
 }
 
-/// 3D experts (`DeepseekV4Experts`): `gate_up_proj [E, 2*int, h]` and
-/// `down_proj [E, h, int]`. Per-expert swiGLU matches `_apply_gate`.
+/// Routed expert weights stored as 3D tensors (`DeepseekV4Experts`):
+/// `gate_up_proj` `[E, 2*inter, hidden]` and `down_proj` `[E, hidden, inter]`.
 pub struct DeepseekV4Experts {
     num_experts: usize,
     gate_up_proj: Tensor,
     down_proj: Tensor,
-    act: Activation,
     limit: f64,
 }
 
 impl DeepseekV4Experts {
     pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
         let e = cfg.n_routed_experts;
-        let h = cfg.hidden_size;
-        let int = cfg.moe_intermediate_size;
+        let inter = cfg.moe_intermediate_size;
+        let hidden = cfg.hidden_size;
+        let gate_up_proj = vb.get((e, 2 * inter, hidden), "gate_up_proj")?;
+        let down_proj = vb.get((e, hidden, inter), "down_proj")?;
         Ok(Self {
             num_experts: e,
-            gate_up_proj: vb.get((e, 2 * int, h), "gate_up_proj")?,
-            down_proj: vb.get((e, h, int), "down_proj")?,
-            act: cfg.hidden_act,
+            gate_up_proj,
+            down_proj,
             limit: cfg.swiglu_limit,
         })
     }
 
-    fn apply_gate(&self, gate_up: &Tensor) -> Result<Tensor> {
-        let chunks = gate_up.chunk(2, D::Minus1)?;
-        let gate = chunks[0].clamp(f64::NEG_INFINITY, self.limit)?;
-        let up = chunks[1].clamp(-self.limit, self.limit)?;
-        &self.act.forward(&gate)? * &up
-    }
-
-    /// `topk_ids`/`topk_weight` are `[n, top_k]`; gather per-expert activations
-    /// with `index_add`, mirroring `DeepseekV4Experts.forward`.
-    pub fn forward(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
-        let topk_ids = topk_ids.contiguous()?;
-        let mut y = xs.zeros_like()?;
-        let counts = topk_ids.flatten_all()?.bincount(self.num_experts as u32)?;
-        for (i, &cnt) in counts.iter().enumerate() {
-            if cnt == 0 {
-                continue;
-            }
-            let idx_top = topk_ids.eq(i as f64)?.nonzero()?.t()?;
-            let idx = &idx_top.i(0)?.contiguous()?;
-            let top = &idx_top.i(1)?.contiguous()?;
-            let x = xs.index_select(idx, 0)?;
-            let gate_up = x.matmul(&self.gate_up_proj.i(i)?.t()?)?;
-            let current = self
-                .apply_gate(&gate_up)?
-                .matmul(&self.down_proj.i(i)?.t()?)?;
-            let w = topk_weight
-                .index_select(idx, 0)?
-                .gather(&top.unsqueeze(1)?, 1)?
-                .squeeze(1)?
-                .unsqueeze(D::Minus1)?
-                .to_dtype(xs.dtype())?;
-            y = y.index_add(idx, &current.broadcast_mul(&w)?, 0)?;
+    /// `hidden_states` is `[N, hidden]`; `top_k_index` and `top_k_weights` are
+    /// `[N, K]`. Non-routed tokens contribute weight 0, matching the reference's
+    /// `index_add_` over only the routed tokens.
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        top_k_index: &Tensor,
+        top_k_weights: &Tensor,
+    ) -> Result<Tensor> {
+        let n = hidden_states.dim(0)?;
+        let k = top_k_index.dim(1)?;
+        let dev = hidden_states.device();
+        let dtype = hidden_states.dtype();
+        let mut out = hidden_states.zeros_like()?;
+        let zero = Tensor::zeros((n, k), dtype, dev)?;
+        for i in 0..self.num_experts {
+            let sel = top_k_index.eq(i as u32)?; // [N,K] bool
+            let w = sel.where_cond(top_k_weights, &zero)?;
+            let wsum = w.sum(D::Minus1)?; // [N]
+            let gu = self.gate_up_proj.narrow(0, i, 1)?.squeeze(0)?; // [2*inter, hidden]
+            let all = hidden_states.matmul(&gu.t()?)?; // [N, 2*inter]
+            let chunks = all.chunk(2, D::Minus1)?;
+            let gate = chunks[0].clamp(f64::NEG_INFINITY, self.limit)?;
+            let up = chunks[1].clamp(-self.limit, self.limit)?;
+            let act = (candle_nn::ops::silu(&gate)? * up)?; // [N, inter]
+            let down_w = self.down_proj.narrow(0, i, 1)?.squeeze(0)?; // [hidden, inter]
+            let down = act.matmul(&down_w.t()?)?; // [N, hidden]
+            let contrib = down.broadcast_mul(&wsum.unsqueeze(D::Minus1)?)?;
+            out = out.add(&contrib)?;
         }
-        Ok(y)
+        Ok(out)
     }
 }
 
-/// Top-k router (`DeepseekV4TopKRouter`): `logits = gate.weight`; scores =
-/// sqrtsoftplus(logits); indices = topk(scores + e_score_correction_bias, top_k);
-/// weights = gather(scores, indices); normalized by sum (+1e-20) and scaled by
+/// Learned top-k router (`DeepseekV4TopKRouter`): `sqrt_softplus` scores,
+/// top-k indices, weights normalized over the selected experts and scaled by
 /// `routed_scaling_factor`.
 pub struct DeepseekV4TopKRouter {
-    weight: Tensor,
-    e_score_correction_bias: Tensor,
     top_k: usize,
+    hidden_size: usize,
+    weight: Tensor,
     routed_scaling_factor: f64,
 }
 
 impl DeepseekV4TopKRouter {
     pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?;
-        let bias = match vb.get((cfg.n_routed_experts,), "e_score_correction_bias") {
-            Ok(b) => b,
-            Err(_) => Tensor::zeros(cfg.n_routed_experts, DType::F32, vb.device())?,
-        };
         Ok(Self {
-            weight,
-            e_score_correction_bias: bias,
             top_k: cfg.num_experts_per_tok,
+            hidden_size: cfg.hidden_size,
+            weight: vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?,
             routed_scaling_factor: cfg.routed_scaling_factor,
         })
     }
 
-    /// Returns `(logits, weights, indices)` with `weights`/`indices` shaped
-    /// `[n, top_k]`.
-    pub fn forward(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let h = self.weight.dim(1)?;
-        let flat = hidden_states.reshape(((), h))?;
-        let logits = flat.matmul(&self.weight.t()?)?;
+    /// `x` is `[N, hidden]`; returns `(weights [N,K], indices [N,K])`.
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n: usize = x.dims()[..x.rank() - 1].iter().product();
+        let flat = x.reshape((n, self.hidden_size))?;
+        let logits = flat.matmul(&self.weight.t()?)?; // [N, E]
         let scores = sqrt_softplus(&logits)?;
-        let biased = scores.broadcast_add(&self.e_score_correction_bias)?;
-        let indices = biased.topk_unsorted(self.top_k)?.indices;
-        let weights = scores.gather(&indices, D::Minus1)?;
-        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
-        let weights = (weights.broadcast_div(&denom)? * self.routed_scaling_factor)?;
-        Ok((logits, weights, indices))
+        let indices = topk_last_dim(&scores, self.top_k)?; // [N, K]
+        let weights = scores.gather(&indices, D::Minus1)?; // [N, K]
+        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
+        let weights = weights.broadcast_div(&denom)?;
+        let weights = (weights * self.routed_scaling_factor)?;
+        Ok((weights, indices))
     }
 }
 
-/// Hash router (`DeepseekV4HashRouter`): expert selection from the frozen
-/// `tid2eid [vocab, top_k]` lookup (first `num_hash_layers` layers); the learned
-/// `weight` still produces the per-expert scores used for the weights.
+/// Hash router (`DeepseekV4HashRouter`): expert selection via a frozen
+/// token-id→expert-id `tid2eid` lookup; the learned gate still scores the
+/// selected experts' activations.
 pub struct DeepseekV4HashRouter {
+    hidden_size: usize,
     weight: Tensor,
     tid2eid: Tensor,
     routed_scaling_factor: f64,
@@ -1583,163 +1707,267 @@ pub struct DeepseekV4HashRouter {
 
 impl DeepseekV4HashRouter {
     pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?;
-        let tid2eid = vb.get((cfg.vocab_size, cfg.num_experts_per_tok), "tid2eid")?;
         Ok(Self {
-            weight,
-            tid2eid,
+            hidden_size: cfg.hidden_size,
+            weight: vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?,
+            tid2eid: vb.get((cfg.vocab_size, cfg.num_experts_per_tok), "tid2eid")?,
             routed_scaling_factor: cfg.routed_scaling_factor,
         })
     }
 
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        input_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let h = self.weight.dim(1)?;
-        let flat = hidden_states.reshape(((), h))?;
+    /// `x` is `[N, hidden]`, `input_ids` is `[N]`; returns
+    /// `(weights [N,K], indices [N,K])`.
+    pub fn forward(&self, x: &Tensor, input_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n: usize = x.dims()[..x.rank() - 1].iter().product();
+        let flat = x.reshape((n, self.hidden_size))?;
         let logits = flat.matmul(&self.weight.t()?)?;
         let scores = sqrt_softplus(&logits)?;
-        let ids = input_ids.flatten_all()?.to_dtype(DType::U32)?;
-        let indices = self
-            .tid2eid
-            .index_select(&ids, 0)?
-            .to_dtype(DType::U32)?
-            .contiguous()?;
+        let ids = input_ids.flatten_all()?; // [N]
+        let indices = self.tid2eid.index_select(&ids, 0)?; // [N, K]
         let weights = scores.gather(&indices, D::Minus1)?;
-        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
-        let weights = (weights.broadcast_div(&denom)? * self.routed_scaling_factor)?;
-        Ok((logits, weights, indices))
+        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
+        let weights = weights.broadcast_div(&denom)?;
+        let weights = (weights * self.routed_scaling_factor)?;
+        Ok((weights, indices))
     }
 }
 
-enum DeepseekV4Router {
+enum DeepseekV4MoeGate {
     TopK(DeepseekV4TopKRouter),
     Hash(DeepseekV4HashRouter),
 }
 
-impl DeepseekV4Router {
-    fn forward(
-        &self,
-        hidden_states: &Tensor,
-        input_ids: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        match self {
-            Self::TopK(r) => r.forward(hidden_states),
-            Self::Hash(r) => r.forward(hidden_states, input_ids.unwrap()),
-        }
-    }
-}
-
-/// Sparse MoE block (`DeepseekV4SparseMoeBlock`): a top-k or hash router, 3D
-/// experts, and a shared-experts MLP added to the routed output. The first
-/// `num_hash_layers` layers use the hash router; the rest use top-k.
+/// Sparse MoE block (`DeepseekV4SparseMoeBlock`): top-k or hash routing plus
+/// routed experts plus a shared expert.
 pub struct DeepseekV4SparseMoeBlock {
-    gate: DeepseekV4Router,
+    gate: DeepseekV4MoeGate,
     experts: DeepseekV4Experts,
-    shared_experts: DeepseekV4Mlp,
+    shared_experts: DeepseekV4MLP,
 }
 
 impl DeepseekV4SparseMoeBlock {
     pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
-        let is_hash = layer_idx < cfg.num_hash_layers;
-        let gate = if is_hash {
-            DeepseekV4Router::Hash(DeepseekV4HashRouter::new(cfg, vb.pp("gate"))?)
+        let gate = if layer_idx < cfg.num_hash_layers {
+            DeepseekV4MoeGate::Hash(DeepseekV4HashRouter::new(cfg, vb.pp("gate"))?)
         } else {
-            DeepseekV4Router::TopK(DeepseekV4TopKRouter::new(cfg, vb.pp("gate"))?)
+            DeepseekV4MoeGate::TopK(DeepseekV4TopKRouter::new(cfg, vb.pp("gate"))?)
         };
+        let experts = DeepseekV4Experts::new(cfg, vb.pp("experts"))?;
+        let shared_experts = DeepseekV4MLP::new(cfg, vb.pp("shared_experts"))?;
         Ok(Self {
             gate,
-            experts: DeepseekV4Experts::new(cfg, vb.pp("experts"))?,
-            shared_experts: DeepseekV4Mlp::new(cfg, vb.pp("shared_experts"))?,
+            experts,
+            shared_experts,
         })
     }
 
-    /// Forward, returning `(output, router_logits)`. The logits are used for the
-    /// optional auxiliary load-balancing loss.
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        input_ids: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        let (bs, seq_len, h) = hidden_states.dims3()?;
-        let flat = hidden_states.reshape(((), h))?;
-        let (logits, weights, indices) = self.gate.forward(hidden_states, input_ids)?;
+    /// `x` is `[B, S, D]`; `input_ids` (when hash-routed) matches `x`'s token
+    /// count. Returns `[B, S, D]`.
+    pub fn forward(&self, x: &Tensor, input_ids: Option<&Tensor>) -> Result<Tensor> {
+        let (bs, seq, d) = x.dims3()?;
+        let flat = x.reshape((bs * seq, d))?;
+        let (weights, indices) = match &self.gate {
+            DeepseekV4MoeGate::TopK(g) => g.forward(&flat)?,
+            DeepseekV4MoeGate::Hash(g) => g.forward(&flat, input_ids.unwrap())?,
+        };
         let routed = self
             .experts
             .forward(&flat, &indices, &weights)?
-            .reshape((bs, seq_len, h))?;
-        let shared = self.shared_experts.forward(hidden_states)?;
-        Ok(((routed + shared)?, logits))
+            .reshape((bs, seq, d))?;
+        let shared = self.shared_experts.forward(x)?;
+        routed.add(&shared)
     }
 }
 
-/// Auxiliary load-balancing loss (Switch Transformer), matching
-/// `load_balancing_loss_func` in `modeling_deepseek_v4.py`. `gate_logits` are
-/// the per-layer router logits (`[n, num_experts]`); `attention_mask` is the
-/// flat per-token mask (weights padding tokens to zero).
-pub fn load_balancing_loss(
-    gate_logits: &[Tensor],
-    num_experts: usize,
-    top_k: usize,
-    attention_mask: Option<&Tensor>,
-) -> Result<Tensor> {
-    if gate_logits.is_empty() {
-        return Tensor::zeros(1, DType::F32, &Device::Cpu);
+/// One V4 decoder block (paper §2): an mHC hyper-connection around each of the
+/// attention and MoE sublayers, with the `hc_mult` residual streams kept in
+/// shape `[B, S, hc_mult, D]` throughout.
+pub struct DeepseekV4DecoderLayer {
+    self_attn: DeepseekV4Attention,
+    mlp: DeepseekV4SparseMoeBlock,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
+    attn_hc: DeepseekV4HyperConnection,
+    ffn_hc: DeepseekV4HyperConnection,
+}
+
+impl DeepseekV4DecoderLayer {
+    pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let self_attn = DeepseekV4Attention::new(cfg, layer_idx, vb.pp("self_attn"))?;
+        let mlp = DeepseekV4SparseMoeBlock::new(cfg, layer_idx, vb.pp("mlp"))?;
+        let input_layernorm =
+            candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = candle_nn::rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
+        let attn_hc = DeepseekV4HyperConnection::new(cfg, vb.pp("attn_hc"))?;
+        let ffn_hc = DeepseekV4HyperConnection::new(cfg, vb.pp("ffn_hc"))?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            attn_hc,
+            ffn_hc,
+        })
     }
-    let mut tokens_per_expert_sum = vec![0.0f32; num_experts];
-    let mut router_prob_sum = vec![0.0f32; num_experts];
-    let mut total_rows = 0.0f32;
-    let flat_mask: Option<Vec<f32>> = match attention_mask {
-        Some(m) => Some(m.flatten_all()?.to_vec1::<f32>()?),
-        None => None,
-    };
-    for layer_gate in gate_logits {
-        let rw = candle_nn::ops::softmax_last_dim(layer_gate)?.to_dtype(DType::F32)?;
-        let n = rw.dim(0)?;
-        match &flat_mask {
-            None => {
-                let counts = rw
-                    .topk_unsorted(top_k)?
-                    .indices
-                    .flatten_all()?
-                    .bincount(num_experts as u32)?;
-                for (i, c) in counts.iter().enumerate() {
-                    tokens_per_expert_sum[i] += *c as f32;
-                }
-                let col = rw.sum_keepdim(0)?.flatten_all()?;
-                let col = col.to_vec1::<f32>()?;
-                for (i, s) in col.iter().enumerate() {
-                    router_prob_sum[i] += s;
-                }
-                total_rows += n as f32;
-            }
-            Some(mask) => {
-                let sel = rw.topk_unsorted(top_k)?.indices.flatten_all()?;
-                let sel = sel.to_vec1::<u32>()?;
-                for (pos, &e) in sel.iter().enumerate() {
-                    tokens_per_expert_sum[e as usize] += mask[pos / top_k];
-                }
-                let mask_t = Tensor::from_vec(mask.clone(), n, &Device::Cpu)?;
-                let col = rw
-                    .broadcast_mul(&mask_t.unsqueeze(1)?)?
-                    .sum_keepdim(0)?
-                    .flatten_all()?;
-                let col = col.to_vec1::<f32>()?;
-                for (i, s) in col.iter().enumerate() {
-                    router_prob_sum[i] += s;
-                }
-                total_rows += mask.iter().sum::<f32>();
-            }
+
+    pub fn forward(
+        &mut self,
+        hidden_states: &Tensor,
+        input_ids: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let dtype = hidden_states.dtype();
+        let (post, comb, collapsed) = self.attn_hc.forward(hidden_states)?;
+        let normed = self.input_layernorm.forward(&collapsed)?;
+        let attn_output = self.self_attn.forward(&normed, seqlen_offset)?;
+        let hidden_states = post
+            .to_dtype(dtype)?
+            .unsqueeze(D::Minus1)?
+            .broadcast_mul(&attn_output.unsqueeze(D::Minus2)?)?
+            .broadcast_add(
+                &comb
+                    .to_dtype(dtype)?
+                    .transpose(D::Minus1, D::Minus2)?
+                    .matmul(hidden_states)?,
+            )?;
+
+        let (post, comb, collapsed) = self.ffn_hc.forward(&hidden_states)?;
+        let normed = self.post_attention_layernorm.forward(&collapsed)?;
+        let mlp_output = self.mlp.forward(&normed, input_ids)?;
+        post.to_dtype(dtype)?
+            .unsqueeze(D::Minus1)?
+            .broadcast_mul(&mlp_output.unsqueeze(D::Minus2)?)?
+            .broadcast_add(
+                &comb
+                    .to_dtype(dtype)?
+                    .transpose(D::Minus1, D::Minus2)?
+                    .matmul(&hidden_states)?,
+            )
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
+    }
+}
+
+/// Full V4 stack: token embedding, per-`layer_types` decoder layers, final mHC
+/// head collapse and RMSNorm.
+pub struct DeepseekV4Model {
+    hidden_size: usize,
+    hc_mult: usize,
+    embed_tokens: candle_nn::Embedding,
+    layers: Vec<DeepseekV4DecoderLayer>,
+    norm: RmsNorm,
+    hc_head: DeepseekV4HyperHead,
+}
+
+impl DeepseekV4Model {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|i| DeepseekV4DecoderLayer::new(cfg, i, vb.pp(format!("layers.{i}"))))
+            .collect::<Result<Vec<_>>>()?;
+        let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let hc_head = DeepseekV4HyperHead::new(cfg, vb.pp("hc_head"))?;
+        Ok(Self {
+            hidden_size: cfg.hidden_size,
+            hc_mult: cfg.hc_mult,
+            embed_tokens,
+            layers,
+            norm,
+            hc_head,
+        })
+    }
+
+    /// Runs the full stack. `seqlen_offset` is the absolute position of the
+    /// first token in `input_ids` (0 for a fresh prefill; the running token
+    /// count during KV-cache decode).
+    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let (bs, seq) = input_ids.dims2()?;
+        let emb = self.embed_tokens.forward(input_ids)?; // [B,S,D]
+        let hidden = emb
+            .unsqueeze(2)?
+            .broadcast_as((bs, seq, self.hc_mult, self.hidden_size))?
+            .contiguous()?; // [B,S,H,D]
+        let mut hidden = hidden;
+        for layer in &mut self.layers {
+            hidden = layer.forward(&hidden, Some(input_ids), seqlen_offset)?;
+        }
+        let collapsed = self.hc_head.forward(&hidden)?; // [B,S,D]
+        self.norm.forward(&collapsed)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
         }
     }
-    let total = total_rows.max(1e-9);
-    let mut overall = 0.0f32;
-    for i in 0..num_experts {
-        overall += (tokens_per_expert_sum[i] / total) * (router_prob_sum[i] / total);
+}
+
+/// `DeepseekV4ForCausalLM`: the model plus a separate (untied) `lm_head`.
+pub struct DeepseekV4ForCausalLM {
+    model: DeepseekV4Model,
+    lm_head: Linear,
+}
+
+impl DeepseekV4ForCausalLM {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let model = DeepseekV4Model::new(cfg, vb.pp("model"))?;
+        let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        Ok(Self { model, lm_head })
     }
-    Tensor::new(overall * num_experts as f32, &Device::Cpu)
+
+    /// Returns `[B, S, vocab]` logits.
+    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let hidden = self.model.forward(input_ids, seqlen_offset)?;
+        self.lm_head.forward(&hidden)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+    /// Autoregressive generation over the incremental compressed-KV cache.
+    ///
+    /// `prompt` is `[B, S]` (B == 1) of integer token ids. The first
+    /// `forward` prefills the whole prompt at `seqlen_offset = 0`; each later
+    /// step decodes a single token at the running absolute position, so the
+    /// attention/compressor caches grow incrementally (one token per step).
+    /// `sample` receives the last-position `[vocab]` logits and returns the
+    /// next token id (the caller chooses the sampler: ArgMax/TopK/TopP/etc.).
+    /// Returns the generated token ids (excluding the prompt, including the
+    /// EOS token if it is emitted).
+    pub fn generate(
+        &mut self,
+        prompt: &Tensor,
+        max_new_tokens: usize,
+        eos_token_id: usize,
+        mut sample: impl FnMut(&Tensor) -> Result<u32>,
+    ) -> Result<Vec<u32>> {
+        self.clear_kv_cache();
+        let mut pos = 0usize; // absolute position of the first token of `next`
+        let mut next = prompt.clone();
+        let mut out = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            let logits = self.forward(&next, pos)?; // [1, S, vocab]
+            let last = logits
+                .narrow(D::Minus2, logits.dim(D::Minus2)? - 1, 1)?
+                .squeeze(0)?
+                .squeeze(0)?; // [vocab]
+            let tok = sample(&last)?;
+            out.push(tok);
+            if tok as usize == eos_token_id {
+                break;
+            }
+            pos += next.dim(D::Minus1)?;
+            next = Tensor::new(&[tok], prompt.device())?.unsqueeze(0)?;
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -2004,6 +2232,17 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+    /// Decode-parity config: small dims for CPU speed but the real compressor
+    /// rates (CSA 4, HCA 128) and a large `max_position_embeddings` so the
+    /// RoPE tables cover a 300+ token decode (compressed entries are RoPE'd at
+    /// strided absolute positions up to `n_windows * rate`).
+    fn decode_parity_config() -> DeepseekV4Config {
+        let mut cfg = parity_config();
+        cfg.compress_rates.compressed_sparse_attention = 4;
+        cfg.compress_rates.heavily_compressed_attention = 128;
+        cfg.max_position_embeddings = 4096;
+        cfg
     }
 
     /// Deterministic weight tensor: `w[i] = sin((i + base) * 0.13) * 0.5`.
@@ -2415,28 +2654,33 @@ mod tests {
         // Per-query top-k with causal + invalid clamping.
         let icomp_len = icompressed.dim(1)?;
         let top_k = cfg.index_topk.min(icomp_len);
-        let threshold: Vec<f32> = (0..seq_len)
-            .map(|t| ((seqlen_offset + t + 1) / rate) as f32)
-            .collect();
-        let threshold =
-            Tensor::from_vec(threshold, (1, seq_len), dev)?.broadcast_as((batch, seq_len))?;
-        let entry = Tensor::arange(0u32, icomp_len as u32, dev)?.to_dtype(DType::F32)?;
-        let entry_b = entry
-            .reshape((1, 1, icomp_len))?
-            .broadcast_as((batch, seq_len, icomp_len))?;
-        let thresh_b = threshold
-            .reshape((batch, seq_len, 1))?
-            .broadcast_as((batch, seq_len, icomp_len))?;
-        let future = entry_b.ge(&thresh_b)?;
-        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, icomp_len), dev)?;
-        let masked = future.where_cond(&neg_inf, &scores)?;
-        let topk = topk_last_dim(&masked, top_k)?;
-        let thresh_k = threshold
-            .reshape((batch, seq_len, 1))?
-            .broadcast_as((batch, seq_len, top_k))?;
-        let invalid = topk.to_dtype(DType::F32)?.ge(&thresh_k)?;
-        let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), dev)?;
-        let topk = invalid.where_cond(&minus_one, &topk)?;
+        let topk = if icomp_len == 0 || top_k == 0 {
+            // No compressed entries yet (early decode steps): empty pick set.
+            Tensor::zeros((batch, seq_len, 0), DType::I64, dev)?
+        } else {
+            let threshold: Vec<f32> = (0..seq_len)
+                .map(|t| ((seqlen_offset + t + 1) / rate) as f32)
+                .collect();
+            let threshold =
+                Tensor::from_vec(threshold, (1, seq_len), dev)?.broadcast_as((batch, seq_len))?;
+            let entry = Tensor::arange(0u32, icomp_len as u32, dev)?.to_dtype(DType::F32)?;
+            let entry_b = entry
+                .reshape((1, 1, icomp_len))?
+                .broadcast_as((batch, seq_len, icomp_len))?;
+            let thresh_b = threshold
+                .reshape((batch, seq_len, 1))?
+                .broadcast_as((batch, seq_len, icomp_len))?;
+            let future = entry_b.ge(&thresh_b)?;
+            let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, icomp_len), dev)?;
+            let masked = future.where_cond(&neg_inf, &scores)?;
+            let topk = topk_last_dim(&masked, top_k)?;
+            let thresh_k = threshold
+                .reshape((batch, seq_len, 1))?
+                .broadcast_as((batch, seq_len, top_k))?;
+            let invalid = topk.to_dtype(DType::F32)?.ge(&thresh_k)?;
+            let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), dev)?;
+            invalid.where_cond(&minus_one, &topk)?
+        };
 
         // block_bias: 0 at valid selected compressed positions, -inf else.
         let c_len = compressed_len as i64;
@@ -2788,29 +3032,236 @@ mod tests {
         Ok(())
     }
 
-    /// MoE parity config: hidden=8, moe_intermediate=16, n_routed_experts=8,
-    /// num_experts_per_tok=2, num_hash_layers=1 (layer 0 hash, layer 1 top-k),
-    /// norm_topk_prob, routed_scaling_factor=2.5, scoring sqrtsoftplus.
-    fn moe_parity_config() -> DeepseekV4Config {
+    /// Reference mHC mixer (transcribed from `modeling_deepseek_v4.py`
+    /// `DeepseekV4HyperConnection.forward`): returns `(post, comb, collapsed)`.
+    fn ref_hc(
+        cfg: &DeepseekV4Config,
+        fn_: &Tensor,
+        base: &Tensor,
+        scale: &Tensor,
+        streams: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let hc = cfg.hc_mult;
+        let flat = UnweightedRMSNorm::new(cfg.rms_norm_eps)
+            .forward(&streams.flatten_from(2)?.to_dtype(DType::F32)?)?;
+        let (b, sl, k) = flat.dims3()?;
+        let lin = flat
+            .reshape((b * sl, k))?
+            .matmul(&fn_.t()?)?
+            .reshape((b, sl, (2 + hc) * hc))?;
+        let pre_w = lin.narrow(D::Minus1, 0, hc)?;
+        let post_w = lin.narrow(D::Minus1, hc, hc)?;
+        let comb_w = lin.narrow(D::Minus1, 2 * hc, hc * hc)?;
+        let pre_b = base.narrow(0, 0, hc)?;
+        let post_b = base.narrow(0, hc, hc)?;
+        let comb_b = base.narrow(0, 2 * hc, hc * hc)?;
+        let s = scale.to_vec1::<f32>()?;
+        let (pre_scale, post_scale, comb_scale) = (s[0] as f64, s[1] as f64, s[2] as f64);
+        let pre =
+            (candle_nn::ops::sigmoid(&(pre_w * pre_scale)?.broadcast_add(&pre_b)?)? + cfg.hc_eps)?;
+        let post =
+            (candle_nn::ops::sigmoid(&(post_w * post_scale)?.broadcast_add(&post_b)?)? * 2.0)?;
+        let (b, sl, _) = lin.dims3()?;
+        let comb_logits = ((comb_w.reshape((b, sl, hc, hc))? * comb_scale)?)
+            .broadcast_add(&comb_b.reshape((hc, hc))?)?;
+        let comb = sinkhorn(&comb_logits, cfg.hc_eps, cfg.hc_sinkhorn_iters)?;
+        let collapsed = pre
+            .unsqueeze(D::Minus1)?
+            .broadcast_mul(streams)?
+            .sum(D::Minus2)?
+            .to_dtype(streams.dtype())?;
+        Ok((post, comb, collapsed))
+    }
+
+    /// Reference final HC-head collapse (`DeepseekV4HyperHead.forward`).
+    fn ref_hc_head(
+        cfg: &DeepseekV4Config,
+        hc_fn: &Tensor,
+        hc_base: &Tensor,
+        hc_scale: &Tensor,
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let flat = UnweightedRMSNorm::new(cfg.rms_norm_eps)
+            .forward(&x.flatten_from(2)?.to_dtype(DType::F32)?)?;
+        let (b, sl, k) = flat.dims3()?;
+        let mixes =
+            flat.reshape((b * sl, k))?
+                .matmul(&hc_fn.t()?)?
+                .reshape((b, sl, hc_fn.dim(0)?))?;
+        let scale = hc_scale.to_vec1::<f32>()?[0] as f64;
+        let pre =
+            (candle_nn::ops::sigmoid(&(mixes * scale)?.broadcast_add(hc_base)?)? + cfg.hc_eps)?;
+        pre.unsqueeze(D::Minus1)?
+            .broadcast_mul(x)?
+            .sum(D::Minus2)?
+            .to_dtype(x.dtype())
+    }
+
+    /// Reference shared-expert MLP (`DeepseekV4MLP.forward`).
+    fn ref_mlp(
+        cfg: &DeepseekV4Config,
+        gw: &Tensor,
+        uw: &Tensor,
+        dw: &Tensor,
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let gate = lin(x, gw)?.clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
+        let up = lin(x, uw)?.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
+        lin(&(candle_nn::ops::silu(&gate)? * up)?, dw)
+    }
+
+    /// Reference sparse MoE block (top-k router + routed experts + shared
+    /// expert), transcribed from `DeepseekV4SparseMoeBlock.forward` +
+    /// `DeepseekV4Experts.forward`. `p` is the `model.layers.{i}` prefix.
+    fn ref_moe(
+        cfg: &DeepseekV4Config,
+        p: &str,
+        w: &HashMap<String, Tensor>,
+        x: &Tensor,
+    ) -> Result<Tensor> {
+        let (bs, seq, d) = x.dims3()?;
+        let flat = x.reshape((bs * seq, d))?;
+        let scores = sqrt_softplus(&flat.matmul(&w[&format!("{p}.mlp.gate.weight")].t()?)?)?;
+        let indices = topk_last_dim(&scores, cfg.num_experts_per_tok)?;
+        let weights = scores.gather(&indices, D::Minus1)?;
+        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
+        let weights = (weights.broadcast_div(&denom)? * cfg.routed_scaling_factor)?;
+        let n = flat.dim(0)?;
+        let k = indices.dim(1)?;
+        let zero = Tensor::zeros((n, k), DType::F32, x.device())?;
+        let mut out = flat.zeros_like()?;
+        for i in 0..cfg.n_routed_experts {
+            let sel = indices.eq(i as u32)?;
+            let wsel = sel.where_cond(&weights, &zero)?;
+            let wsum = wsel.sum(D::Minus1)?;
+            let gu = w[&format!("{p}.mlp.experts.gate_up_proj")]
+                .narrow(0, i, 1)?
+                .squeeze(0)?;
+            let all = flat.matmul(&gu.t()?)?;
+            let c = all.chunk(2, D::Minus1)?;
+            let gate = c[0].clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
+            let up = c[1].clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
+            let act = (candle_nn::ops::silu(&gate)? * up)?;
+            let dw = w[&format!("{p}.mlp.experts.down_proj")]
+                .narrow(0, i, 1)?
+                .squeeze(0)?;
+            let down = act.matmul(&dw.t()?)?;
+            out = out.add(&down.broadcast_mul(&wsum.unsqueeze(D::Minus1)?)?)?;
+        }
+        let shared = ref_mlp(
+            cfg,
+            &w[&format!("{p}.mlp.shared_experts.gate_proj.weight")],
+            &w[&format!("{p}.mlp.shared_experts.up_proj.weight")],
+            &w[&format!("{p}.mlp.shared_experts.down_proj.weight")],
+            x,
+        )?;
+        let routed = out.reshape((bs, seq, d))?;
+        routed.add(&shared)
+    }
+
+    /// Reference full-model forward for an all-sliding-attention stack,
+    /// transcribing `DeepseekV4Model.forward` and `DeepseekV4ForCausalLM.forward`
+    /// and returning `[B, S, vocab]` logits.
+    #[allow(clippy::type_complexity)]
+    fn ref_model_forward(
+        cfg: &DeepseekV4Config,
+        emb: &DeepseekV4RotaryEmbedding,
+        w: &HashMap<String, Tensor>,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        caches: &mut [Option<Tensor>],
+    ) -> Result<Tensor> {
+        let (bs, seq) = input_ids.dims2()?;
+        let hc = cfg.hc_mult;
+        let hidden = w["model.embed_tokens.weight"]
+            .index_select(&input_ids.flatten_all()?, 0)?
+            .reshape((bs, seq, cfg.hidden_size))?;
+        let mut streams = hidden
+            .unsqueeze(2)?
+            .broadcast_as((bs, seq, hc, cfg.hidden_size))?
+            .contiguous()?;
+        for (i, cache) in caches.iter_mut().enumerate() {
+            let p = format!("model.layers.{i}");
+            // Attention half.
+            let (post, comb, collapsed) = ref_hc(
+                cfg,
+                &w[&format!("{p}.attn_hc.fn")],
+                &w[&format!("{p}.attn_hc.base")],
+                &w[&format!("{p}.attn_hc.scale")],
+                &streams,
+            )?;
+            let normed = rms_w(
+                &collapsed,
+                &w[&format!("{p}.input_layernorm.weight")],
+                cfg.rms_norm_eps,
+            )?;
+            let mut aw = HashMap::new();
+            for k in [
+                "q_a_proj.weight",
+                "q_a_norm.weight",
+                "q_b_proj.weight",
+                "kv_proj.weight",
+                "kv_norm.weight",
+                "o_a_proj.weight",
+                "o_b_proj.weight",
+                "sinks",
+            ] {
+                aw.insert(k.to_string(), w[&format!("{p}.self_attn.{k}")].clone());
+            }
+            let attn_out = reference_forward(cfg, emb, &aw, &normed, seqlen_offset, cache)?;
+            streams = post
+                .unsqueeze(D::Minus1)?
+                .broadcast_mul(&attn_out.unsqueeze(D::Minus2)?)?
+                .broadcast_add(&comb.transpose(D::Minus1, D::Minus2)?.matmul(&streams)?)?;
+            // FFN half.
+            let (post, comb, collapsed) = ref_hc(
+                cfg,
+                &w[&format!("{p}.ffn_hc.fn")],
+                &w[&format!("{p}.ffn_hc.base")],
+                &w[&format!("{p}.ffn_hc.scale")],
+                &streams,
+            )?;
+            let normed = rms_w(
+                &collapsed,
+                &w[&format!("{p}.post_attention_layernorm.weight")],
+                cfg.rms_norm_eps,
+            )?;
+            let mlp_out = ref_moe(cfg, &p, w, &normed)?;
+            streams = post
+                .unsqueeze(D::Minus1)?
+                .broadcast_mul(&mlp_out.unsqueeze(D::Minus2)?)?
+                .broadcast_add(&comb.transpose(D::Minus1, D::Minus2)?.matmul(&streams)?)?;
+        }
+        let collapsed = ref_hc_head(
+            cfg,
+            &w["model.hc_head.hc_fn"],
+            &w["model.hc_head.hc_base"],
+            &w["model.hc_head.hc_scale"],
+            &streams,
+        )?;
+        let normed = rms_w(&collapsed, &w["model.norm.weight"], cfg.rms_norm_eps)?;
+        lin(&normed, &w["lm_head.weight"])
+    }
+
+    /// Small all-sliding 2-layer config for the full-model parity tests.
+    fn model_config() -> DeepseekV4Config {
         serde_json::from_str(
             r#"{
-                "vocab_size": 32, "hidden_size": 8, "moe_intermediate_size": 16,
+                "vocab_size": 64, "hidden_size": 8, "moe_intermediate_size": 16,
                 "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
                 "head_dim": 4, "q_lora_rank": 4, "o_lora_rank": 4, "qk_rope_head_dim": 2,
-                "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 2,
-                "num_nextn_predict_layers": 0, "o_groups": 2, "num_hash_layers": 1,
+                "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                "num_nextn_predict_layers": 0, "o_groups": 2, "num_hash_layers": 0,
                 "index_head_dim": 2, "index_n_heads": 1, "index_topk": 4, "hc_mult": 2,
                 "hc_sinkhorn_iters": 5, "hc_eps": 1e-6, "partial_rotary_factor": 0.5,
-                "sliding_window": 3, "max_position_embeddings": 8, "rms_norm_eps": 1e-6,
+                "sliding_window": 6, "max_position_embeddings": 32, "rms_norm_eps": 1e-6,
                 "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
                 "attention_bias": false, "attention_dropout": 0.0, "mlp_bias": false,
-                "norm_topk_prob": true, "routed_scaling_factor": 2.5,
-                "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
-                "swiglu_limit": 10.0, "initializer_range": 0.02,
                 "output_router_logits": false, "router_aux_loss_coef": 0.001, "router_jitter_noise": 0.0,
-                "use_cache": true, "bos_token_id": 0, "eos_token_id": 1,
+                "swiglu_limit": 10.0, "initializer_range": 0.02, "use_cache": true,
+                "bos_token_id": 0, "eos_token_id": 1,
                 "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
-                "compress_ratios": [0, 0],
+                "compress_ratios": [0, 0, 0, 0],
                 "layer_types": ["sliding_attention", "sliding_attention"],
                 "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16,
                                  "original_max_position_embeddings": 65536, "type": "yarn"}
@@ -2819,192 +3270,317 @@ mod tests {
         .unwrap()
     }
 
-    /// MoE weights keyed by their state-dict path (`mlp.…`).
-    fn moe_parity_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
-        let e = cfg.n_routed_experts;
-        let h = cfg.hidden_size;
-        let int = cfg.moe_intermediate_size;
+    /// Deterministic weights for the full model under `DeepseekV4ForCausalLM`'s
+    /// `VarBuilder` namespace.
+    fn model_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
+        let h = cfg.num_attention_heads;
+        let d = cfg.head_dim;
         let mut m = HashMap::new();
-        m.insert("mlp.gate.weight".into(), det_tensor(&[e, h], 1.0));
         m.insert(
-            "mlp.gate.e_score_correction_bias".into(),
-            det_tensor(&[e], 2.0),
-        );
-        let vocab = cfg.vocab_size;
-        let tk = cfg.num_experts_per_tok;
-        let v: Vec<u32> = (0..vocab * tk).map(|i| (i as u32) % (e as u32)).collect();
-        m.insert(
-            "mlp.gate.tid2eid".into(),
-            Tensor::from_vec(v, &[vocab, tk], &Device::Cpu).unwrap(),
+            "model.embed_tokens.weight".into(),
+            det_tensor(&[cfg.vocab_size, cfg.hidden_size], 201.0),
         );
         m.insert(
-            "mlp.experts.gate_up_proj".into(),
-            det_tensor(&[e, 2 * int, h], 3.0),
+            "lm_head.weight".into(),
+            det_tensor(&[cfg.vocab_size, cfg.hidden_size], 202.0),
         );
         m.insert(
-            "mlp.experts.down_proj".into(),
-            det_tensor(&[e, h, int], 4.0),
+            "model.norm.weight".into(),
+            det_tensor(&[cfg.hidden_size, 1], 203.0)
+                .flatten_all()
+                .unwrap(),
         );
         m.insert(
-            "mlp.shared_experts.gate_proj.weight".into(),
-            det_tensor(&[int, h], 5.0),
+            "model.hc_head.hc_fn".into(),
+            det_tensor(&[cfg.hc_mult, cfg.hc_mult * cfg.hidden_size], 204.0),
         );
         m.insert(
-            "mlp.shared_experts.up_proj.weight".into(),
-            det_tensor(&[int, h], 6.0),
+            "model.hc_head.hc_base".into(),
+            det_tensor(&[cfg.hc_mult], 205.0).flatten_all().unwrap(),
         );
         m.insert(
-            "mlp.shared_experts.down_proj.weight".into(),
-            det_tensor(&[h, int], 7.0),
+            "model.hc_head.hc_scale".into(),
+            det_tensor(&[1], 206.0).flatten_all().unwrap(),
         );
+        for i in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{i}");
+            let b = 300.0 + i as f32 * 100.0;
+            m.insert(
+                format!("{p}.self_attn.q_a_proj.weight"),
+                det_tensor(&[cfg.q_lora_rank, cfg.hidden_size], b + 1.0),
+            );
+            m.insert(
+                format!("{p}.self_attn.q_a_norm.weight"),
+                det_tensor(&[cfg.q_lora_rank, 1], b + 2.0)
+                    .flatten_all()
+                    .unwrap(),
+            );
+            m.insert(
+                format!("{p}.self_attn.q_b_proj.weight"),
+                det_tensor(&[h * d, cfg.q_lora_rank], b + 3.0),
+            );
+            m.insert(
+                format!("{p}.self_attn.kv_proj.weight"),
+                det_tensor(&[d, cfg.hidden_size], b + 4.0),
+            );
+            m.insert(
+                format!("{p}.self_attn.kv_norm.weight"),
+                det_tensor(&[d, 1], b + 5.0).flatten_all().unwrap(),
+            );
+            m.insert(
+                format!("{p}.self_attn.o_a_proj.weight"),
+                det_tensor(
+                    &[cfg.o_groups * cfg.o_lora_rank, h * d / cfg.o_groups],
+                    b + 6.0,
+                ),
+            );
+            m.insert(
+                format!("{p}.self_attn.o_b_proj.weight"),
+                det_tensor(&[cfg.hidden_size, cfg.o_groups * cfg.o_lora_rank], b + 7.0),
+            );
+            m.insert(
+                format!("{p}.self_attn.sinks"),
+                det_tensor(&[h], b + 8.0).flatten_all().unwrap(),
+            );
+            let mix = (2 + cfg.hc_mult) * cfg.hc_mult;
+            m.insert(
+                format!("{p}.attn_hc.fn"),
+                det_tensor(&[mix, cfg.hc_mult * cfg.hidden_size], b + 9.0),
+            );
+            m.insert(
+                format!("{p}.attn_hc.base"),
+                det_tensor(&[mix], b + 10.0).flatten_all().unwrap(),
+            );
+            m.insert(
+                format!("{p}.attn_hc.scale"),
+                det_tensor(&[3], b + 11.0).flatten_all().unwrap(),
+            );
+            m.insert(
+                format!("{p}.ffn_hc.fn"),
+                det_tensor(&[mix, cfg.hc_mult * cfg.hidden_size], b + 12.0),
+            );
+            m.insert(
+                format!("{p}.ffn_hc.base"),
+                det_tensor(&[mix], b + 13.0).flatten_all().unwrap(),
+            );
+            m.insert(
+                format!("{p}.ffn_hc.scale"),
+                det_tensor(&[3], b + 14.0).flatten_all().unwrap(),
+            );
+            m.insert(
+                format!("{p}.input_layernorm.weight"),
+                det_tensor(&[cfg.hidden_size, 1], b + 15.0)
+                    .flatten_all()
+                    .unwrap(),
+            );
+            m.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                det_tensor(&[cfg.hidden_size, 1], b + 16.0)
+                    .flatten_all()
+                    .unwrap(),
+            );
+            m.insert(
+                format!("{p}.mlp.gate.weight"),
+                det_tensor(&[cfg.n_routed_experts, cfg.hidden_size], b + 17.0),
+            );
+            m.insert(
+                format!("{p}.mlp.experts.gate_up_proj"),
+                det_tensor(
+                    &[
+                        cfg.n_routed_experts,
+                        2 * cfg.moe_intermediate_size,
+                        cfg.hidden_size,
+                    ],
+                    b + 18.0,
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.experts.down_proj"),
+                det_tensor(
+                    &[
+                        cfg.n_routed_experts,
+                        cfg.hidden_size,
+                        cfg.moe_intermediate_size,
+                    ],
+                    b + 19.0,
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_experts.gate_proj.weight"),
+                det_tensor(&[cfg.moe_intermediate_size, cfg.hidden_size], b + 20.0),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_experts.up_proj.weight"),
+                det_tensor(&[cfg.moe_intermediate_size, cfg.hidden_size], b + 21.0),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_experts.down_proj.weight"),
+                det_tensor(&[cfg.hidden_size, cfg.moe_intermediate_size], b + 22.0),
+            );
+        }
         m
     }
 
-    /// Independent transcription of the transformers MoE path
-    /// (`DeepseekV4SparseMoeBlock.forward`, `modeling_deepseek_v4.py` L1076-1093),
-    /// driven by the same weight tensors as the candle module.
-    fn ref_moe(
-        cfg: &DeepseekV4Config,
-        w: &HashMap<String, Tensor>,
-        x: &Tensor,
-        input_ids: Option<&Tensor>,
-        layer_idx: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let h = cfg.hidden_size;
-        let e = cfg.n_routed_experts;
-        let top_k = cfg.num_experts_per_tok;
-        let is_hash = layer_idx < cfg.num_hash_layers;
-        let flat = x.reshape(((), h))?;
-        let gate_w = w.get("mlp.gate.weight").unwrap();
-        let logits = lin(&flat, gate_w)?;
-        let scores = sqrt_softplus(&logits)?;
-        let indices = if is_hash {
-            let tid2eid = w.get("mlp.gate.tid2eid").unwrap();
-            let ids = input_ids.unwrap().flatten_all()?;
-            tid2eid.index_select(&ids, 0)?.contiguous()?
-        } else {
-            let bias = w.get("mlp.gate.e_score_correction_bias").unwrap();
-            let biased = scores.broadcast_add(bias)?;
-            biased.topk_unsorted(top_k)?.indices
-        };
-        let mut weights = scores.gather(&indices, D::Minus1)?;
-        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
-        weights = (weights.broadcast_div(&denom)? * cfg.routed_scaling_factor)?;
-        // experts
-        let gate_up = w.get("mlp.experts.gate_up_proj").unwrap();
-        let down = w.get("mlp.experts.down_proj").unwrap();
-        let mut routed = flat.zeros_like()?;
-        let counts = indices.flatten_all()?.bincount(e as u32)?;
-        for (i, &cnt) in counts.iter().enumerate() {
-            if cnt == 0 {
-                continue;
-            }
-            let idx_top = indices.eq(i as f64)?.nonzero()?.t()?;
-            let idx = &idx_top.i(0)?.contiguous()?;
-            let top = &idx_top.i(1)?.contiguous()?;
-            let xs = flat.index_select(idx, 0)?;
-            let gu = xs.matmul(&gate_up.i(i)?.t()?)?;
-            let ch = gu.chunk(2, D::Minus1)?;
-            let g = ch[0].clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
-            let up = ch[1].clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
-            let gated = (&cfg.hidden_act.forward(&g)? * &up)?;
-            let cur = gated.matmul(&down.i(i)?.t()?)?;
-            let wgt = weights
-                .index_select(idx, 0)?
-                .gather(&top.unsqueeze(1)?, 1)?
-                .squeeze(1)?
-                .unsqueeze(D::Minus1)?
-                .to_dtype(flat.dtype())?;
-            routed = routed.index_add(idx, &cur.broadcast_mul(&wgt)?, 0)?;
-        }
-        // shared experts
-        let g_w = w.get("mlp.shared_experts.gate_proj.weight").unwrap();
-        let u_w = w.get("mlp.shared_experts.up_proj.weight").unwrap();
-        let d_w = w.get("mlp.shared_experts.down_proj.weight").unwrap();
-        let gate = lin(x, g_w)?.clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
-        let up = lin(x, u_w)?.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
-        let shared = lin(&(&cfg.hidden_act.forward(&gate)? * &up)?, d_w)?;
-        let out = (&routed.reshape(x.shape())? + &shared)?;
-        Ok((out, logits))
-    }
-
     #[test]
-    fn moe_parity_with_transformers() -> candle::Result<()> {
-        let cfg = moe_parity_config();
+    fn hyper_connection_matches_reference() -> candle::Result<()> {
+        let cfg = parity_config();
         let dev = Device::Cpu;
-        let weights = moe_parity_weights(&cfg);
-        // Top-k router layer (index >= num_hash_layers).
-        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 1, vb.pp("mlp"))?;
-        let x = det_tensor(&[2, 3, cfg.hidden_size], 91.0);
-        let (out, _) = moe.forward(&x, None)?;
-        let (ref_out, _) = ref_moe(&cfg, &weights, &x, None, 1)?;
-        assert_eq!(out.dims(), ref_out.dims(), "moe-topk shape");
-        assert_close(&out, &ref_out, 1e-4, "moe-topk");
-        // Hash router layer (layer_idx < num_hash_layers), with input_ids.
-        let vb2 = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let moe_hash = DeepseekV4SparseMoeBlock::new(&cfg, 0, vb2.pp("mlp"))?;
-        let ids = Tensor::new(&[3u32, 7, 2, 1, 0, 5][..], &dev)?;
-        let x2 = det_tensor(&[2, 3, cfg.hidden_size], 92.0);
-        let (out2, _) = moe_hash.forward(&x2, Some(&ids))?;
-        let (ref_out2, _) = ref_moe(&cfg, &weights, &x2, Some(&ids), 0)?;
-        assert_eq!(out2.dims(), ref_out2.dims(), "moe-hash shape");
-        assert_close(&out2, &ref_out2, 1e-4, "moe-hash");
+        let hc = cfg.hc_mult;
+        let mut m = HashMap::new();
+        m.insert(
+            "fn".into(),
+            det_tensor(&[(2 + hc) * hc, hc * cfg.hidden_size], 91.0),
+        );
+        m.insert(
+            "base".into(),
+            det_tensor(&[(2 + hc) * hc], 92.0).flatten_all().unwrap(),
+        );
+        m.insert(
+            "scale".into(),
+            det_tensor(&[3], 93.0).flatten_all().unwrap(),
+        );
+        let vb = VarBuilder::from_tensors(m.clone(), DType::F32, &dev);
+        let hcmod = DeepseekV4HyperConnection::new(&cfg, vb)?;
+        let streams = det_tensor(&[1, 4, hc, cfg.hidden_size], 94.0);
+        let (post, comb, collapsed) = hcmod.forward(&streams)?;
+        let (rpost, rcomb, rcollapsed) = ref_hc(&cfg, &m["fn"], &m["base"], &m["scale"], &streams)?;
+        assert_eq!(post.dims(), rpost.dims(), "post shape");
+        assert_eq!(comb.dims(), rcomb.dims(), "comb shape");
+        assert_eq!(collapsed.dims(), rcollapsed.dims(), "collapsed shape");
+        assert_close(&post, &rpost, 1e-4, "hc-post");
+        assert_close(&comb, &rcomb, 1e-4, "hc-comb");
+        assert_close(&collapsed, &rcollapsed, 1e-4, "hc-collapsed");
         Ok(())
     }
 
-    /// Independent reference for the auxiliary load-balancing loss (no mask).
-    fn ref_load_balancing(logits: &[Tensor], e: usize, top_k: usize) -> f32 {
-        let mut tps = vec![0.0f32; e];
-        let mut rps = vec![0.0f32; e];
-        let mut total = 0.0f32;
-        for lg in logits {
-            let rw = candle_nn::ops::softmax_last_dim(lg)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap();
-            let (n, ne) = rw.dims2().unwrap();
-            assert_eq!(ne, e);
-            let sel = rw.topk_unsorted(top_k).unwrap().indices;
-            let counts = sel.flatten_all().unwrap().bincount(e as u32).unwrap();
-            for (i, c) in counts.iter().enumerate() {
-                tps[i] += *c as f32;
-            }
-            let col = rw.sum_keepdim(0).unwrap().flatten_all().unwrap();
-            let col = col.to_vec1::<f32>().unwrap();
-            for (i, s) in col.iter().enumerate() {
-                rps[i] += s;
-            }
-            total += n as f32;
-        }
-        let mut overall = 0.0;
-        for i in 0..e {
-            overall += (tps[i] / total) * (rps[i] / total);
-        }
-        overall * e as f32
+    #[test]
+    fn hyper_head_matches_reference() -> candle::Result<()> {
+        let cfg = parity_config();
+        let dev = Device::Cpu;
+        let hc = cfg.hc_mult;
+        let mut m = HashMap::new();
+        m.insert(
+            "hc_fn".into(),
+            det_tensor(&[hc, hc * cfg.hidden_size], 95.0),
+        );
+        m.insert(
+            "hc_base".into(),
+            det_tensor(&[hc], 96.0).flatten_all().unwrap(),
+        );
+        m.insert(
+            "hc_scale".into(),
+            det_tensor(&[1], 97.0).flatten_all().unwrap(),
+        );
+        let vb = VarBuilder::from_tensors(m.clone(), DType::F32, &dev);
+        let hh = DeepseekV4HyperHead::new(&cfg, vb)?;
+        let x = det_tensor(&[1, 3, hc, cfg.hidden_size], 98.0);
+        let out = hh.forward(&x)?;
+        let ref_out = ref_hc_head(&cfg, &m["hc_fn"], &m["hc_base"], &m["hc_scale"], &x)?;
+        assert_close(&out, &ref_out, 1e-4, "hc-head");
+        Ok(())
     }
 
     #[test]
-    fn moe_aux_loss_matches_reference() -> candle::Result<()> {
-        let cfg = moe_parity_config();
+    fn deepseek_v4_model_forward_parity_with_transformers() -> candle::Result<()> {
+        let cfg = model_config();
         let dev = Device::Cpu;
-        let weights = moe_parity_weights(&cfg);
+        let weights = model_weights(&cfg);
         let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 1, vb.pp("mlp"))?;
-        let x = det_tensor(&[2, 3, cfg.hidden_size], 95.0);
-        let (_, logits) = moe.forward(&x, None)?;
-        let l = load_balancing_loss(
-            std::slice::from_ref(&logits),
-            cfg.n_routed_experts,
-            cfg.num_experts_per_tok,
-            None,
-        )?;
-        let expected = ref_load_balancing(&[logits], cfg.n_routed_experts, cfg.num_experts_per_tok);
-        let got: f32 = l.to_scalar()?;
-        assert!(
-            (got - expected).abs() < 1e-4,
-            "aux loss got {got}, expected {expected}"
-        );
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+        let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?; // [1,5]
+        let logits = model.forward(&ids, 0)?;
+        let mut caches: Vec<Option<Tensor>> = vec![None; cfg.num_hidden_layers];
+        let ref_logits = ref_model_forward(&cfg, &emb, &weights, &ids, 0, &mut caches)?;
+        assert_eq!(logits.dims(), ref_logits.dims(), "logits shape");
+        assert_close(&logits, &ref_logits, 1e-4, "model-forward");
+        Ok(())
+    }
+
+    #[test]
+    fn deepseek_v4_generation_matches_reference() -> candle::Result<()> {
+        let cfg = model_config();
+        let dev = Device::Cpu;
+        let weights = model_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+        // Prefill of 4 tokens.
+        let prompt = Tensor::new(&[2u32, 5, 1, 4][..], &dev)?.unsqueeze(0)?;
+        let l0 = model.forward(&prompt, 0)?;
+        let mut caches: Vec<Option<Tensor>> = vec![None; cfg.num_hidden_layers];
+        let r0 = ref_model_forward(&cfg, &emb, &weights, &prompt, 0, &mut caches)?;
+        assert_close(&l0, &r0, 1e-4, "prefill");
+
+        // Decode 3 tokens greedily, comparing logits and chosen token per step.
+        let mut cur = l0
+            .narrow(D::Minus2, l0.dim(D::Minus2)? - 1, 1)?
+            .argmax(D::Minus1)?
+            .to_dtype(DType::U32)?;
+        for step in 0..3 {
+            let l = model.forward(&cur, 4 + step)?;
+            let r = ref_model_forward(&cfg, &emb, &weights, &cur, 4 + step, &mut caches)?;
+            assert_close(&l, &r, 1e-4, &format!("decode{step}"));
+            cur = l
+                .narrow(D::Minus2, 0, 1)?
+                .argmax(D::Minus1)?
+                .to_dtype(DType::U32)?;
+            let ref_cur = r
+                .narrow(D::Minus2, 0, 1)?
+                .argmax(D::Minus1)?
+                .to_dtype(DType::U32)?;
+            let a = cur.flatten_all()?.to_vec1::<u32>()?;
+            let b = ref_cur.flatten_all()?.to_vec1::<u32>()?;
+            assert_eq!(a, b, "decode step {step} token mismatch");
+        }
+        Ok(())
+    }
+    #[test]
+    fn deepseek_v4_generate_matches_reference() -> candle::Result<()> {
+        let cfg = model_config();
+        let dev = Device::Cpu;
+        let weights = model_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+        let prompt = Tensor::new(&[2u32, 5, 1, 4][..], &dev)?.unsqueeze(0)?;
+        let eos = 1u32;
+        let max_new = 5usize;
+
+        // Public `generate()` with an ArgMax sampler over last-position logits.
+        let tokens = model.generate(&prompt, max_new, eos as usize, |logits| {
+            let t = logits
+                .argmax(D::Minus1)?
+                .to_dtype(DType::U32)?
+                .to_vec0::<u32>()?;
+            Ok(t)
+        })?;
+
+        // Independent reference greedy decode (stateless full-history recompute).
+        let mut caches: Vec<Option<Tensor>> = vec![None; cfg.num_hidden_layers];
+        let r0 = ref_model_forward(&cfg, &emb, &weights, &prompt, 0, &mut caches)?;
+        let mut cur = r0
+            .narrow(D::Minus2, r0.dim(D::Minus2)? - 1, 1)?
+            .argmax(D::Minus1)?
+            .to_dtype(DType::U32)?;
+        let mut ref_tokens = Vec::new();
+        for step in 0..max_new {
+            let r = ref_model_forward(&cfg, &emb, &weights, &cur, 4 + step, &mut caches)?;
+            let rt = r
+                .narrow(D::Minus2, 0, 1)?
+                .argmax(D::Minus1)?
+                .to_dtype(DType::U32)?
+                .flatten_all()?
+                .to_vec1::<u32>()?[0];
+            ref_tokens.push(rt);
+            if rt == eos {
+                break;
+            }
+            cur = Tensor::new(&[rt], &dev)?.unsqueeze(0)?;
+        }
+        assert_eq!(tokens, ref_tokens, "generated token sequence mismatch");
         Ok(())
     }
 
@@ -3017,5 +3593,108 @@ mod tests {
             let ok = (x.is_nan() && y.is_nan()) || (x == y) || (x - y).abs() < tol;
             assert!(ok, "{label}[{i}]: got {x}, expected {y}");
         }
+    }
+    /// Multi-step (300+) decode parity: the incremental compressor cache (one
+    /// token per `forward` call, carrying buffer / overlap / running state
+    /// across calls) must produce the same `compressed_kv` + `block_bias` as a
+    /// stateless full-history recompute of the whole prefix at every step, for
+    /// both CSA (rate 4, overlap carry-across-forward) and HCA (rate 128).
+    #[test]
+    fn incremental_decode_parity_vs_full_history() -> candle::Result<()> {
+        let cfg = decode_parity_config();
+        let dev = Device::Cpu;
+        let n_steps = 320usize;
+
+        // ---- CSA (rate 4, overlap carry-across-forward) ----
+        {
+            let weights = csa_parity_weights(&cfg);
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+            let mut comp = DeepseekV4CSACompressor::new(&cfg, vb)?;
+            let rotary = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+            let mut hist: Option<Tensor> = None; // [B, H, hidden]
+            let mut qhist: Option<Tensor> = None; // [B, H, q_lora_rank]
+
+            for t in 0..n_steps {
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (100 + t) as f32);
+                let qr = det_tensor(&[1, 1, cfg.q_lora_rank], (200 + t) as f32);
+                hist = Some(match hist {
+                    Some(h) => Tensor::cat(&[&h, &x], 1)?,
+                    None => x.clone(),
+                });
+                qhist = Some(match qhist {
+                    Some(h) => Tensor::cat(&[&h, &qr], 1)?,
+                    None => qr.clone(),
+                });
+                let h = hist.as_ref().unwrap();
+                let qh = qhist.as_ref().unwrap();
+
+                // Incremental cache: single-token forward at absolute position t.
+                let (ckv, bb) = comp.forward(&x, &qr, t)?;
+                // Full-history eager recompute over the whole prefix.
+                let (r_ckv, r_bb) = ref_csa(&cfg, &weights, &rotary, h, qh, 0, &mut (None, None))?;
+                assert_eq!(
+                    ckv.dims(),
+                    r_ckv.dims(),
+                    "CSA step {t}: compressed_kv shape"
+                );
+                assert_close(&ckv, &r_ckv, 1e-4, &format!("CSA step {t}: compressed_kv"));
+
+                // Last full-history query row == the single-token block_bias.
+                let h_len = h.dim(1)?;
+                let r_bb_last = r_bb.narrow(2, h_len - 1, 1)?;
+                assert_eq!(
+                    bb.dims(),
+                    r_bb_last.dims(),
+                    "CSA step {t}: block_bias shape"
+                );
+                assert_close(&bb, &r_bb_last, 1e-4, &format!("CSA step {t}: block_bias"));
+            }
+        }
+
+        // ---- HCA (rate 128) ----
+        {
+            let weights = hca_parity_weights(&cfg);
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+            let mut comp = DeepseekV4HCACompressor::new(&cfg, vb)?;
+            let rotary = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+            let mut hist: Option<Tensor> = None; // [B, H, hidden]
+            let mut qhist: Option<Tensor> = None; // [B, H, q_lora_rank]
+
+            for t in 0..n_steps {
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (300 + t) as f32);
+                let qr = det_tensor(&[1, 1, cfg.q_lora_rank], (400 + t) as f32);
+                hist = Some(match hist {
+                    Some(h) => Tensor::cat(&[&h, &x], 1)?,
+                    None => x.clone(),
+                });
+                qhist = Some(match qhist {
+                    Some(h) => Tensor::cat(&[&h, &qr], 1)?,
+                    None => qr.clone(),
+                });
+                let h = hist.as_ref().unwrap();
+                let qh = qhist.as_ref().unwrap();
+
+                let (ckv, bb) = comp.forward(&x, &qr, t)?;
+                let (r_ckv, r_bb) = ref_hca(&cfg, &weights, &rotary, h, qh, 0)?;
+                assert_eq!(
+                    ckv.dims(),
+                    r_ckv.dims(),
+                    "HCA step {t}: compressed_kv shape"
+                );
+                assert_close(&ckv, &r_ckv, 1e-4, &format!("HCA step {t}: compressed_kv"));
+
+                let h_len = h.dim(1)?;
+                let r_bb_last = r_bb.narrow(2, h_len - 1, 1)?;
+                assert_eq!(
+                    bb.dims(),
+                    r_bb_last.dims(),
+                    "HCA step {t}: block_bias shape"
+                );
+                assert_close(&bb, &r_bb_last, 1e-4, &format!("HCA step {t}: block_bias"));
+            }
+        }
+        Ok(())
     }
 }
