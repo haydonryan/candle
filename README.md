@@ -92,7 +92,9 @@ We also provide some command line based examples using state of the art models:
 - [Quantized LLaMA](./candle-examples/examples/quantized/): quantized version of
   the LLaMA model using the same quantization techniques as
   [llama.cpp](https://github.com/ggerganov/llama.cpp).
-- [Quantized Qwen3 MoE](./candle-examples/examples/quantized-qwen3-moe/): support gguf quantized models of Qwen3 MoE models.
+- [DeepSeek V4](./candle-examples/examples/deepseekv4/): DeepSeek-MoE-style
+  model with sliding-window MLA and compressed-sparse attention, including a
+  custom DSA flash kernel (see the [DeepSeek V4](#deepseek-v4) section below).
 
 <img src="https://github.com/huggingface/candle/raw/main/candle-examples/examples/quantized/assets/aoc.gif" width="600">
   
@@ -170,8 +172,71 @@ wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/model.bin
 wget https://huggingface.co/spaces/lmz/candle-llama2/resolve/main/tokenizer.json
 trunk serve --release --port 8081
 ```
-And then head over to
-[http://localhost:8081/](http://localhost:8081/).
+## DeepSeek V4
+
+[DeepSeek V4](./candle-examples/examples/deepseekv4/) is a DeepSeek-MoE-style
+model implemented in `candle-transformers` (`models::deepseek_v4`). It layers a
+mix of three attention types, selected per layer by `layer_types`:
+
+- **SlidingAttention** — standard sliding-window MLA (multi-head latent
+  attention) with a single shared `Hkv = 1` KV head.
+- **CompressedSparseAttention (CSA)** — the long-range path: per-layer KV is
+  compressed into windows (rate from `compress_rates.compressed_sparse_attention`)
+  and a Lightning Indexer picks the relevant compressed blocks (top-k, with a
+  block-sparse bias), yielding sparse attention.
+- **HeavilyCompressedAttention (HCA)** — a very high compression-rate
+  (heavily-compressed) global context path.
+
+Compressor layers use Yarn RoPE (`compress_rope_theta`) and a per-layer
+compression rate; plain sliding layers use `rope_theta`. The model also uses
+hyper-connection (mHC) residual streams, hash + top-k MoE routing, and a
+shared-expert MLP.
+
+**Eager-only upstream reference.** The HuggingFace `transformers` implementation
+of DeepSeek V4 is eager-only; there is no upstream flash path. Candle's eager
+path is a direct transcription of `modeling_deepseek_v4.py` (validated by the
+`*_parity_with_transformers` tests and the transformers-parity harness).
+
+**Custom DSA flash kernel.** For CUDA, `candle-flash-attn` provides a custom
+deep-sparse-attention (DSA) flash kernel (`flash_attn_windowed_blockmask` for
+prefill and `flash_attn_varlen_paged_windowed_blockmask` for batched
+varlen/paged decode) that fuses the windowed mask, per-head sink, block-sparse
+indexer bias, max-subtraction, softmax and sink-drop. It is wired into the
+model with the `flash-attn` feature and matches the eager path within a bf16
+tolerance (see `flash_eager_parity*` and `*_decode_parity*` tests).
+
+**Build & run.** Build with CUDA + the flash DSA kernel:
+
+```bash
+cargo run --example deepseekv4 --release --features cuda,flash-attn -- \
+    --model-dir sample_models/deepseek-v4-tiny \
+    --prompt "The capital of France is" --sample-len 64          # eager
+cargo run --example deepseekv4 --release --features cuda,flash-attn -- \
+    --model-dir sample_models/deepseek-v4-tiny --use-flash-attn \
+    --prompt "The capital of France is" --sample-len 64          # flash DSA
+```
+
+`--use-flash-attn` requires the `flash-attn` feature and a CUDA GPU; without it
+the eager decode path is used. CPU-only builds use `--cpu`.
+
+**Parity harness.** `candle-examples/examples/deepseekv4/parity_harness.py`
+compares candle (eager + flash) logits against the `transformers` reference on
+the tiny sample model within a bf16 tolerance. The HF checkpoint stores routed
+experts per-expert (`w1/w2/w3`) and the LM head as `head.weight`, which
+`convert_weights.py` rewrites into candle's fused-expert layout; the harness
+applies it automatically. Run it directly, or via the skippable cargo test:
+
+```bash
+DEEPSEEK_V4_TRANSFORMERS_PARITY=1 \
+DEEPSEEK_V4_CANDLE_BIN=$PWD/target/release/examples/deepseekv4 \
+cargo test -p candle-transformers --test deepseek_v4_parity --features flash-attn
+```
+
+Both harness paths require the tiny model weights + tokenizer under
+`sample_models/deepseek-v4-tiny/` (gitignored; restore them from an HF DeepSeek
+V4 download) and a python env with `torch`/`transformers`.
+
+<!--- ANCHOR: useful_libraries --->
 
 <!--- ANCHOR: useful_libraries --->
 

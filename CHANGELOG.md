@@ -1,9 +1,31 @@
 # Changelog
 This documents the main changes to the `candle` crate.
 
-## v0.3.1 - Unreleased
+- DeepSeek V4 support in `candle-transformers` (`deepseek_v4` module):
+  DeepSeek-MoE-style model with sliding-window MLA plus Compressed Sparse
+  Attention (CSA) and Heavily Compressed Attention (HCA) compressors, per-layer
+  RoPE (Yarn for compressor layers), hyper-connection (mHC) residual streams,
+  hash + top-k MoE routing, and the DeepSeek-V4 eager-only reference
+  transcription (all `*_parity_with_transformers` tests).
+- Custom DSA (deep-sparse-attention) flash kernel in `candle-flash-attn`
+  (windowed blockmask + varlen/paged block-sparse decode), wired into the
+  DeepseekV4 model via the `flash-attn` feature on CUDA.
+- `deepseekv4` example (`candle-examples/examples/deepseekv4`): prefill +
+  incremental KV-cache decode with sampling and repeat penalty, plus a
+  `--use-flash-attn` flag for the DSA flash decode path and a deterministic
+  `--dump-logits` prefill mode.
+- DeepSeek V4 transformers-parity harness (`parity_harness.py` +
+  `convert_weights.py`) comparing candle (eager + flash) logits against the
+  HuggingFace `transformers` reference on the tiny sample model, wired as a
+  skippable cargo test (`deepseek_v4_transformers_parity_harness`).
 
-### Added
+### Modified
+
+- `deepseek_v4`: load the hash router's `tid2eid` table as `I64` (fixes loading
+  real HF checkpoints on CUDA), and run hyper-connection / hyper-head collapse
+  in the hidden-state dtype (fixes dtype mismatches with bf16 checkpoints).
+
+## v0.3.0 - 2023-10-01
 
 ### Modified
 

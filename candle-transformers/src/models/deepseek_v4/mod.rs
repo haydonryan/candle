@@ -2050,17 +2050,19 @@ impl DeepseekV4HyperConnection {
             .forward(&hidden_streams.flatten_from(2)?.to_dtype(DType::F32)?)?;
         // F.linear(flat, fn) = flat @ fn^T (flattened to 2D for matmul).
         let (b, sl, k) = flat.dims3()?;
+        let fn_ = self.fn_.to_dtype(flat.dtype())?;
+        let base = self.base.to_dtype(flat.dtype())?;
         let lin = flat
             .reshape((b * sl, k))?
-            .matmul(&self.fn_.t()?)?
+            .matmul(&fn_.t()?)?
             .reshape((b, sl, (2 + hc) * hc))?; // [B, S, (2+H)*H]
         let pre_w = lin.narrow(D::Minus1, 0, hc)?;
         let post_w = lin.narrow(D::Minus1, hc, hc)?;
         let comb_w = lin.narrow(D::Minus1, 2 * hc, hc * hc)?;
-        let pre_b = self.base.narrow(0, 0, hc)?;
-        let post_b = self.base.narrow(0, hc, hc)?;
-        let comb_b = self.base.narrow(0, 2 * hc, hc * hc)?;
-        let s = self.scale.to_vec1::<f32>()?;
+        let pre_b = base.narrow(0, 0, hc)?;
+        let post_b = base.narrow(0, hc, hc)?;
+        let comb_b = base.narrow(0, 2 * hc, hc * hc)?;
+        let s = self.scale.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let (pre_scale, post_scale, comb_scale) = (s[0] as f64, s[1] as f64, s[2] as f64);
 
         let pre =
@@ -2078,10 +2080,10 @@ impl DeepseekV4HyperConnection {
 
         // Collapse the hc_mult streams into a single sequence with the `pre` weights.
         let collapsed = pre
+            .to_dtype(hidden_streams.dtype())?
             .unsqueeze(D::Minus1)?
             .broadcast_mul(hidden_streams)?
-            .sum(D::Minus2)?
-            .to_dtype(hidden_streams.dtype())?;
+            .sum(D::Minus2)?;
         Ok((post, comb, collapsed))
     }
 }
@@ -2117,14 +2119,17 @@ impl DeepseekV4HyperHead {
             .input_norm
             .forward(&x.flatten_from(2)?.to_dtype(DType::F32)?)?;
         let (b, sl, k) = flat.dims3()?;
-        let mixes = flat
-            .reshape((b * sl, k))?
-            .matmul(&self.hc_fn.t()?)?
-            .reshape((b, sl, self.hc_fn.dim(0)?))?; // [B,S,H]
-        let scale = self.hc_scale.to_vec1::<f32>()?[0] as f64;
-        let pre = (candle_nn::ops::sigmoid(&(mixes * scale)?.broadcast_add(&self.hc_base)?)?
-            + self.hc_eps)?;
-        pre.unsqueeze(D::Minus1)?
+        let hc_fn = self.hc_fn.to_dtype(flat.dtype())?;
+        let hc_base = self.hc_base.to_dtype(flat.dtype())?;
+        let mixes =
+            flat.reshape((b * sl, k))?
+                .matmul(&hc_fn.t()?)?
+                .reshape((b, sl, hc_fn.dim(0)?))?; // [B,S,H]
+        let scale = self.hc_scale.to_dtype(DType::F32)?.to_vec1::<f32>()?[0] as f64;
+        let pre =
+            (candle_nn::ops::sigmoid(&(mixes * scale)?.broadcast_add(&hc_base)?)? + self.hc_eps)?;
+        pre.to_dtype(x.dtype())?
+            .unsqueeze(D::Minus1)?
             .broadcast_mul(x)?
             .sum(D::Minus2)?
             .to_dtype(x.dtype())
@@ -2286,7 +2291,12 @@ impl DeepseekV4HashRouter {
         Ok(Self {
             hidden_size: cfg.hidden_size,
             weight: vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?,
-            tid2eid: vb.get((cfg.vocab_size, cfg.num_experts_per_tok), "tid2eid")?,
+            tid2eid: vb.get_with_hints_dtype(
+                (cfg.vocab_size, cfg.num_experts_per_tok),
+                "tid2eid",
+                Default::default(),
+                DType::I64,
+            )?,
             routed_scaling_factor: cfg.routed_scaling_factor,
         })
     }
