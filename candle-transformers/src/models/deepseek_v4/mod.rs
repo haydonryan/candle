@@ -1701,6 +1701,18 @@ mod tests {
         .unwrap()
     }
 
+    /// Decode-parity config: small dims for CPU speed but the real compressor
+    /// rates (CSA 4, HCA 128) and a large `max_position_embeddings` so the
+    /// RoPE tables cover a 300+ token decode (compressed entries are RoPE'd at
+    /// strided absolute positions up to `n_windows * rate`).
+    fn decode_parity_config() -> DeepseekV4Config {
+        let mut cfg = parity_config();
+        cfg.compress_rates.compressed_sparse_attention = 4;
+        cfg.compress_rates.heavily_compressed_attention = 128;
+        cfg.max_position_embeddings = 4096;
+        cfg
+    }
+
     /// Deterministic weight tensor: `w[i] = sin((i + base) * 0.13) * 0.5`.
     fn det_tensor(shape: &[usize], base: f32) -> Tensor {
         let n: usize = shape.iter().product();
@@ -2110,41 +2122,48 @@ mod tests {
         // Per-query top-k with causal + invalid clamping.
         let icomp_len = icompressed.dim(1)?;
         let top_k = cfg.index_topk.min(icomp_len);
-        let threshold: Vec<f32> = (0..seq_len)
-            .map(|t| ((seqlen_offset + t + 1) / rate) as f32)
-            .collect();
-        let threshold =
-            Tensor::from_vec(threshold, (1, seq_len), dev)?.broadcast_as((batch, seq_len))?;
-        let entry = Tensor::arange(0u32, icomp_len as u32, dev)?.to_dtype(DType::F32)?;
-        let entry_b = entry
-            .reshape((1, 1, icomp_len))?
-            .broadcast_as((batch, seq_len, icomp_len))?;
-        let thresh_b = threshold
-            .reshape((batch, seq_len, 1))?
-            .broadcast_as((batch, seq_len, icomp_len))?;
-        let future = entry_b.ge(&thresh_b)?;
-        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, icomp_len), dev)?;
-        let masked = future.where_cond(&neg_inf, &scores)?;
-        let topk = topk_last_dim(&masked, top_k)?;
-        let thresh_k = threshold
-            .reshape((batch, seq_len, 1))?
-            .broadcast_as((batch, seq_len, top_k))?;
-        let invalid = topk.to_dtype(DType::F32)?.ge(&thresh_k)?;
-        let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), dev)?;
-        let topk = invalid.where_cond(&minus_one, &topk)?;
+        let topk = if icomp_len == 0 || top_k == 0 {
+            // No compressed entries yet (early decode steps): mirror
+            // `DeepseekV4Indexer::forward`'s early return of an empty pick set.
+            Tensor::zeros((batch, seq_len, 0), DType::I64, dev)?
+        } else {
+            let threshold: Vec<f32> = (0..seq_len)
+                .map(|t| ((seqlen_offset + t + 1) / rate) as f32)
+                .collect();
+            let threshold =
+                Tensor::from_vec(threshold, (1, seq_len), dev)?.broadcast_as((batch, seq_len))?;
+            let entry = Tensor::arange(0u32, icomp_len as u32, dev)?.to_dtype(DType::F32)?;
+            let entry_b = entry
+                .reshape((1, 1, icomp_len))?
+                .broadcast_as((batch, seq_len, icomp_len))?;
+            let thresh_b = threshold
+                .reshape((batch, seq_len, 1))?
+                .broadcast_as((batch, seq_len, icomp_len))?;
+            let future = entry_b.ge(&thresh_b)?;
+            let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, icomp_len), dev)?;
+            let masked = future.where_cond(&neg_inf, &scores)?;
+            let topk = topk_last_dim(&masked, top_k)?;
+            let thresh_k = threshold
+                .reshape((batch, seq_len, 1))?
+                .broadcast_as((batch, seq_len, top_k))?;
+            let invalid = topk.to_dtype(DType::F32)?.ge(&thresh_k)?;
+            let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), dev)?;
+            invalid.where_cond(&minus_one, &topk)?
+        };
 
         // block_bias: 0 at valid selected compressed positions, -inf else.
         let c_len = compressed_len as i64;
+        let topk_len = topk.dim(2)?;
         let valid = topk.ge(0i64)?;
-        let padding = Tensor::full(c_len, (batch, seq_len, top_k), dev)?;
+        let padding = Tensor::full(c_len, (batch, seq_len, topk_len), dev)?;
         let safe = valid.where_cond(&topk, &padding)?;
         let cand = Tensor::arange(0u32, compressed_len as u32, dev)?
             .to_dtype(DType::I64)?
             .reshape((1, 1, 1, compressed_len))?;
         let safe_b = safe
             .unsqueeze(3)?
-            .broadcast_as((batch, seq_len, top_k, compressed_len))?;
-        let cand_b = cand.broadcast_as((batch, seq_len, top_k, compressed_len))?;
+            .broadcast_as((batch, seq_len, topk_len, compressed_len))?;
+        let cand_b = cand.broadcast_as((batch, seq_len, topk_len, compressed_len))?;
         let eq = safe_b.eq(&cand_b)?;
         let selected = eq.to_dtype(DType::F32)?.sum(2)?.gt(0f32)?;
         let zeros = Tensor::zeros((batch, seq_len, compressed_len), DType::F32, dev)?;
@@ -2492,5 +2511,109 @@ mod tests {
             let ok = (x.is_nan() && y.is_nan()) || (x == y) || (x - y).abs() < tol;
             assert!(ok, "{label}[{i}]: got {x}, expected {y}");
         }
+    }
+
+    /// Multi-step (300+) decode parity: the incremental compressor cache (one
+    /// token per `forward` call, carrying buffer / overlap / running state
+    /// across calls) must produce the same `compressed_kv` + `block_bias` as a
+    /// stateless full-history recompute of the whole prefix at every step, for
+    /// both CSA (rate 4, overlap carry-across-forward) and HCA (rate 128).
+    #[test]
+    fn incremental_decode_parity_vs_full_history() -> candle::Result<()> {
+        let cfg = decode_parity_config();
+        let dev = Device::Cpu;
+        let n_steps = 320usize;
+
+        // ---- CSA (rate 4, overlap carry-across-forward) ----
+        {
+            let weights = csa_parity_weights(&cfg);
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+            let mut comp = DeepseekV4CSACompressor::new(&cfg, vb)?;
+            let rotary = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+            let mut hist: Option<Tensor> = None; // [B, H, hidden]
+            let mut qhist: Option<Tensor> = None; // [B, H, q_lora_rank]
+
+            for t in 0..n_steps {
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (100 + t) as f32);
+                let qr = det_tensor(&[1, 1, cfg.q_lora_rank], (200 + t) as f32);
+                hist = Some(match hist {
+                    Some(h) => Tensor::cat(&[&h, &x], 1)?,
+                    None => x.clone(),
+                });
+                qhist = Some(match qhist {
+                    Some(h) => Tensor::cat(&[&h, &qr], 1)?,
+                    None => qr.clone(),
+                });
+                let h = hist.as_ref().unwrap();
+                let qh = qhist.as_ref().unwrap();
+
+                // Incremental cache: single-token forward at absolute position t.
+                let (ckv, bb) = comp.forward(&x, &qr, t)?;
+                // Full-history eager recompute over the whole prefix.
+                let (r_ckv, r_bb) = ref_csa(&cfg, &weights, &rotary, h, qh, 0, &mut (None, None))?;
+                assert_eq!(
+                    ckv.dims(),
+                    r_ckv.dims(),
+                    "CSA step {t}: compressed_kv shape"
+                );
+                assert_close(&ckv, &r_ckv, 1e-4, &format!("CSA step {t}: compressed_kv"));
+
+                // Last full-history query row == the single-token block_bias.
+                let h_len = h.dim(1)?;
+                let r_bb_last = r_bb.narrow(2, h_len - 1, 1)?;
+                assert_eq!(
+                    bb.dims(),
+                    r_bb_last.dims(),
+                    "CSA step {t}: block_bias shape"
+                );
+                assert_close(&bb, &r_bb_last, 1e-4, &format!("CSA step {t}: block_bias"));
+            }
+        }
+
+        // ---- HCA (rate 128) ----
+        {
+            let weights = hca_parity_weights(&cfg);
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+            let mut comp = DeepseekV4HCACompressor::new(&cfg, vb)?;
+            let rotary = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+            let mut hist: Option<Tensor> = None; // [B, H, hidden]
+            let mut qhist: Option<Tensor> = None; // [B, H, q_lora_rank]
+
+            for t in 0..n_steps {
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (300 + t) as f32);
+                let qr = det_tensor(&[1, 1, cfg.q_lora_rank], (400 + t) as f32);
+                hist = Some(match hist {
+                    Some(h) => Tensor::cat(&[&h, &x], 1)?,
+                    None => x.clone(),
+                });
+                qhist = Some(match qhist {
+                    Some(h) => Tensor::cat(&[&h, &qr], 1)?,
+                    None => qr.clone(),
+                });
+                let h = hist.as_ref().unwrap();
+                let qh = qhist.as_ref().unwrap();
+
+                let (ckv, bb) = comp.forward(&x, &qr, t)?;
+                let (r_ckv, r_bb) = ref_hca(&cfg, &weights, &rotary, h, qh, 0)?;
+                assert_eq!(
+                    ckv.dims(),
+                    r_ckv.dims(),
+                    "HCA step {t}: compressed_kv shape"
+                );
+                assert_close(&ckv, &r_ckv, 1e-4, &format!("HCA step {t}: compressed_kv"));
+
+                let h_len = h.dim(1)?;
+                let r_bb_last = r_bb.narrow(2, h_len - 1, 1)?;
+                assert_eq!(
+                    bb.dims(),
+                    r_bb_last.dims(),
+                    "HCA step {t}: block_bias shape"
+                );
+                assert_close(&bb, &r_bb_last, 1e-4, &format!("HCA step {t}: block_bias"));
+            }
+        }
+        Ok(())
     }
 }
