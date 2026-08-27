@@ -12,9 +12,12 @@
 //
 // The sink guarantees a finite max even when every KV column is masked (rows never NaN).
 //
-// This is a plain (non-CUTLASS) flash-style kernel: one block per (batch, head, query row),
-// one thread per head-dimension element, online softmax over the KV axis with the sink
-// folded into the running max and denominator.
+// Block-sparse execution: the KV axis is processed in BK=64-column blocks. Any block whose
+// columns are all masked (`-inf`) is skipped entirely - no QK dot, no K/V load, no softmax
+// fold. Because an -inf column contributes exactly 0 to the running max (which starts at the
+// finite sink logit), the denominator, and the accumulator, this is bit-identical to the
+// dense reference while QK/V traffic scales with the attended blocks only (sliding window +
+// selected top-k compressed blocks), not the full KV length.
 //
 // Layouts (contiguous):
 //   q:   [B, Sq, H,  D]   (BF16)
@@ -62,6 +65,7 @@ __global__ void flash_attn_windowed_blockmask_kernel(
     __shared__ float sm_scores[BK];
     __shared__ float sm_red[512];         // reduction scratch (one slot per thread, D <= 512)
     __shared__ float sm_m, sm_l, sm_rescale;
+    __shared__ bool sm_skip;              // block-sparse: 1 if this BK-block is fully masked
 
     if (t == 0) {
         sm_m = sink[h];                   // running max starts at the sink logit (finite)
@@ -73,6 +77,22 @@ __global__ void flash_attn_windowed_blockmask_kernel(
     float acc = 0.0f;
 
     for (int col_base = 0; col_base < Skv; col_base += BK) {
+        // --- BLOCK-SPARSE SKIP: if every column in this BK-block is fully masked
+        // (-inf), skip it entirely - no QK dot, no K/V load, no softmax fold. An
+        // -inf column contributes exactly 0 to the running max (which starts at the
+        // finite sink logit), the denominator, and the accumulator, so skipping is
+        // bit-identical to the dense reference while QK/V traffic is proportional
+        // only to the attended blocks (sliding window + selected compressed blocks).
+        if (t == 0) {
+            bool skip = true;
+            const int end = col_base + BK < Skv ? col_base + BK : Skv;
+            for (int c = col_base; c < end; c++) {
+                if (isfinite(mask[mask_base + c])) { skip = false; break; }
+            }
+            sm_skip = skip;
+        }
+        __syncthreads();
+        if (sm_skip) continue;
         // --- compute the BK column scores (dot + scale + additive mask) ---
         for (int c = 0; c < BK; c++) {
             const int col = col_base + c;
