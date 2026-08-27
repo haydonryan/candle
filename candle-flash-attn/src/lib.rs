@@ -1020,6 +1020,183 @@ pub fn flash_attn_varlen_paged_windowed(
     };
     q.apply_op3(k, v, op)
 }
+/// Custom DeepSeek V4 DSA flash kernel that fuses the exact eager op
+/// (modeling_deepseek_v4.py `eager_attention_forward`):
+///
+/// `QK^T * scale + additive_mask` then a per-head **sink logit** is appended as an extra
+/// KV-axis column, max-subtracted (sink included), softmaxed, the sink column is dropped
+/// (`drop-sink`, leaking probability mass), and the result is weighted against `V`.
+///
+/// The additive mask is **heterogeneous**: a contiguous causal sliding-window over the local
+/// KV prefix plus an arbitrary per-query `block_bias` (0/-inf) over the compressed suffix
+/// (CSA indexer / HCA causality). Both are encoded in a single materialized additive mask
+/// tensor `[B, 1, Sq, Skv]` (0 / -inf), exactly as the eager model constructs it.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor `(batch, seq_len_q, num_heads_q, head_size)`, BF16, contiguous.
+/// * `k` - Key tensor `(batch, seq_len_kv, num_heads_kv, head_size)`, BF16, contiguous.
+/// * `v` - Value tensor `(batch, seq_len_kv, num_heads_kv, head_size)`, BF16, contiguous.
+/// * `block_bias_mask` - Additive attention mask `(batch, 1, seq_len_q, seq_len_kv)`, F32,
+///   values `0` (attend) or `-inf` (mask). Combines the sliding-window local prefix mask and
+///   the per-query compressed-suffix `block_bias`.
+/// * `sink_logits` - Per-head sink logits `(num_heads_q)`, F32.
+/// * `softmax_scale` - Scaling factor for `QK^T` (e.g. `head_size^-0.5`).
+///
+/// MQA/GQA is supported (`num_heads_q % num_heads_kv == 0`). `head_size` must be a power of
+/// two and at most 512. Result shape is `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn_windowed_blockmask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    block_bias_mask: &Tensor,
+    sink_logits: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    let op = FlashAttnBlockMask {
+        softmax_scale,
+        block_bias_mask: block_bias_mask.clone(),
+        sink_logits: sink_logits.clone(),
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Custom-op3 wrapper for [`flash_attn_windowed_blockmask`]. Holds the additive mask and the
+/// per-head sink logits; `cuda_fwd` launches the fused BF16 kernel.
+pub struct FlashAttnBlockMask {
+    pub softmax_scale: f32,
+    /// Additive attention mask `(B, 1, Sq, Skv)`, F32, `0`/`-inf`.
+    pub block_bias_mask: Tensor,
+    /// Per-head sink logits `(H)`, F32.
+    pub sink_logits: Tensor,
+}
+
+impl FlashAttnBlockMask {
+    fn cuda_fwd(
+        &self,
+        q: &candle::CudaStorage,
+        q_l: &Layout,
+        k: &candle::CudaStorage,
+        k_l: &Layout,
+        v: &candle::CudaStorage,
+        v_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let dev = q.device();
+        let out_shape = q_l.shape().clone();
+        if !q_l.is_contiguous() || !k_l.is_contiguous() || !v_l.is_contiguous() {
+            candle::bail!(
+                "flash-attn-windowed-blockmask expects contiguous q/k/v \
+                 (got layouts q={q_l:?}, k={k_l:?}, v={v_l:?})"
+            )
+        }
+
+        let q = q.as_cuda_slice::<bf16>()?;
+        let k = k.as_cuda_slice::<bf16>()?;
+        let v = v.as_cuda_slice::<bf16>()?;
+        let q = q.slice(q_l.start_offset()..);
+        let k = k.slice(k_l.start_offset()..);
+        let v = v.slice(v_l.start_offset()..);
+
+        let (b_sz, seqlen_q, num_heads, head_size) = q_l.shape().dims4()?;
+        let (_, seqlen_kv, num_heads_k, _) = k_l.shape().dims4()?;
+        if v_l.shape().dims4()? != k_l.shape().dims4()? {
+            candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
+        }
+        if head_size > 512 {
+            candle::bail!("flash-attn-windowed-blockmask only supports head size at most 512 (got {head_size})")
+        }
+        if !head_size.is_power_of_two() {
+            candle::bail!(
+                "flash-attn-windowed-blockmask requires a power-of-two head size (got {head_size})"
+            )
+        }
+        if num_heads % num_heads_k != 0 {
+            candle::bail!(
+                "number of k/v heads {num_heads_k} must divide number of query heads {num_heads}"
+            )
+        }
+
+        let (mask, mask_l) = self.block_bias_mask.storage_and_layout();
+        let mask = match &*mask {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            _ => candle::bail!("flash-attn-windowed-blockmask requires a CUDA mask tensor"),
+        };
+        let mask = mask.slice(mask_l.start_offset()..);
+        let (sink, sink_l) = self.sink_logits.storage_and_layout();
+        let sink = match &*sink {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            _ => candle::bail!("flash-attn-windowed-blockmask requires a CUDA sink tensor"),
+        };
+        let sink = sink.slice(sink_l.start_offset()..);
+
+        let stream = dev.cuda_stream();
+        let elem_count = out_shape.elem_count();
+        let mut dst = unsafe { dev.alloc::<bf16>(elem_count)? };
+
+        unsafe {
+            let (q_ptr, _guard) = q.device_ptr(&stream);
+            let (k_ptr, _guard) = k.device_ptr(&stream);
+            let (v_ptr, _guard) = v.device_ptr(&stream);
+            let (mask_ptr, _guard) = mask.device_ptr(&stream);
+            let (sink_ptr, _guard) = sink.device_ptr(&stream);
+            let (dst_ptr, _guard) = dst.device_ptr_mut(&stream);
+            ffi::flash_attn_windowed_blockmask(
+                q_ptr as *const core::ffi::c_void,
+                k_ptr as *const core::ffi::c_void,
+                v_ptr as *const core::ffi::c_void,
+                mask_ptr as *const core::ffi::c_void,
+                sink_ptr as *const core::ffi::c_void,
+                dst_ptr as *const core::ffi::c_void,
+                b_sz as i32,
+                seqlen_q as i32,
+                seqlen_kv as i32,
+                num_heads as i32,
+                num_heads_k as i32,
+                head_size as i32,
+                self.softmax_scale,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        }
+
+        let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        Ok((dst, out_shape))
+    }
+}
+
+impl candle::CustomOp3 for FlashAttnBlockMask {
+    fn name(&self) -> &'static str {
+        "flash-attn-windowed-blockmask"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for flash-attn-windowed-blockmask")
+    }
+
+    fn cuda_fwd(
+        &self,
+        q: &candle::CudaStorage,
+        q_l: &Layout,
+        k: &candle::CudaStorage,
+        k_l: &Layout,
+        v: &candle::CudaStorage,
+        v_l: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        match q.dtype() {
+            candle::DType::BF16 => self.cuda_fwd(q, q_l, k, k_l, v, v_l),
+            dt => candle::bail!(
+                "flash-attn-windowed-blockmask is only supported for bf16 (got {dt:?})"
+            ),
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 /// Flash-attention v2 layer with variable-length batching.
