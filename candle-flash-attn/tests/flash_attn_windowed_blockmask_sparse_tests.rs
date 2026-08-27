@@ -265,3 +265,126 @@ fn dsa_flash_block_sparse_sink() -> Result<()> {
     let sink: Vec<f32> = (0..8).map(|i| i as f32 * 0.5).collect();
     run_cuda_case(1, 8, 64, 256, 8, 1, 128, 32, 8, &sink)
 }
+// ---------------------------------------------------------------------------
+// V4-Flash parity: head_dim 512, 64 heads (the real DeepSeek V4 shape), with a
+// CSA/indexer-style mask. The block-sparse kernel must be bit-identical (within
+// bf16 tolerance) to the masked-dense eager reference at this target shape.
+// ---------------------------------------------------------------------------
+#[test]
+fn dsa_flash_block_sparse_d512_64head() -> Result<()> {
+    // V4-Flash target: head_dim 512, 64 query heads, MQA (1 kv head). CSA-style
+    // compressed suffix (compress_rate 16) so most 64-col blocks are fully masked
+    // and skipped, while the kernel still matches the dense masked reference.
+    run_cuda_case(1, 16, 64, 512, 64, 1, 512, 64, 16, &vec![0.0f32; 64])
+}
+
+// ---------------------------------------------------------------------------
+// Reduced-QK-traffic evidence (ncu unavailable on this host -> timing/event
+// measurement). Run the SAME kernel with a fully-attended mask (dense: no block
+// skipped) vs a mask whose 64-col blocks are mostly fully masked (sparse: those
+// blocks are skipped - no QK dot, no K/V load, no softmax fold). Because QK/V
+// traffic scales with attended blocks only, the sparse mask must run faster.
+// The measured times are printed and recorded in the story comment.
+// ---------------------------------------------------------------------------
+fn skipped_block_fraction(mask: &[f32], sq: usize, skv: usize) -> f32 {
+    let mut skipped = 0usize;
+    let mut total = 0usize;
+    for q in 0..sq {
+        let row = &mask[q * skv..(q + 1) * skv];
+        for base in (0..skv).step_by(64) {
+            let end = (base + 64).min(skv);
+            let mut all_masked = true;
+            for c in base..end {
+                if row[c].is_finite() {
+                    all_masked = false;
+                    break;
+                }
+            }
+            total += 1;
+            if all_masked {
+                skipped += 1;
+            }
+        }
+    }
+    skipped as f32 / total as f32
+}
+
+#[test]
+fn dsa_flash_block_sparse_traffic_evidence() -> Result<()> {
+    use std::time::Instant;
+    let device = Device::new_cuda(0)?;
+    let b = 1usize;
+    let sq = 32usize;
+    let h = 8usize;
+    let hk = 1usize;
+    let d = 512usize;
+    let local_len = 512usize;
+    let compressed_len = 4096usize;
+    let window = 512usize;
+    let compress_rate = 16usize;
+    let skv = local_len + compressed_len;
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let total_q = b * sq * h * d;
+    let total_kv = b * skv * hk * d;
+    let q = (&Tensor::arange(0u32, total_q as u32, &device)?
+        .to_dtype(DType::BF16)?
+        .reshape((b, sq, h, d))?
+        / 30.)?;
+    let k = (&Tensor::arange(0u32, total_kv as u32, &device)?
+        .to_dtype(DType::BF16)?
+        .reshape((b, skv, hk, d))?
+        / 40.)?;
+    let v = (&Tensor::arange(0u32, total_kv as u32, &device)?
+        .to_dtype(DType::BF16)?
+        .reshape((b, skv, hk, d))?
+        / 50.)?;
+    let sink: Vec<f32> = (0..h).map(|i| i as f32 * 0.5).collect();
+    let sink_t = Tensor::from_vec(sink, (h,), &device)?;
+
+    let dense_mask = Tensor::from_vec(vec![0.0f32; sq * skv], (b, 1, sq, skv), &device)?;
+    let sparse = build_hetero_mask(sq, local_len, compressed_len, window, compress_rate);
+    let frac = skipped_block_fraction(&sparse, sq, skv);
+    let sparse_mask = Tensor::from_vec(sparse, (b, 1, sq, skv), &device)?;
+
+    let time = |mask: &Tensor, iters: usize| -> Result<f64> {
+        for _ in 0..5 {
+            let _ =
+                candle_flash_attn::flash_attn_windowed_blockmask(&q, &k, &v, mask, &sink_t, scale)?;
+        }
+        device.synchronize()?;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let _ =
+                candle_flash_attn::flash_attn_windowed_blockmask(&q, &k, &v, mask, &sink_t, scale)?;
+        }
+        device.synchronize()?;
+        Ok(start.elapsed().as_secs_f64() / iters as f64)
+    };
+
+    let iters = 10usize;
+    let dense_s = time(&dense_mask, iters)?;
+    let sparse_s = time(&sparse_mask, iters)?;
+    eprintln!(
+        "dense  mask (all {} blocks attended): {:.3} ms/kernel",
+        skv.div_ceil(64),
+        dense_s * 1e3
+    );
+    eprintln!(
+        "sparse mask ({:.1}% 64-col blocks skipped): {:.3} ms/kernel",
+        frac * 100.0,
+        sparse_s * 1e3
+    );
+    eprintln!(
+        "speedup from skipping masked-out blocks: {:.2}x",
+        dense_s / sparse_s
+    );
+    // Sparse must be measurably faster than dense (block-sparse skips masked blocks,
+    // so QK/load traffic scales with attended blocks only).
+    assert!(
+        sparse_s < dense_s * 0.9,
+        "sparse kernel ({sparse_s:.3}s) not faster than dense ({dense_s:.3}s) - \
+         masked-out blocks were not skipped"
+    );
+    Ok(())
+}
