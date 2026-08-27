@@ -43,18 +43,19 @@ fn eager_ref(
         .unsqueeze(2)?
         .expand((b, skv, hk, groups, d))?
         .reshape((b, skv, h, d))?;
-    let qp = q.permute((0, 2, 1, 3))?;
-    let kp = k.permute((0, 2, 1, 3))?;
-    let attn = (qp.matmul(&kp.transpose(2, 3)?)? * scale as f64)?;
-    let attn = (attn + mask)?;
+    let qp = q.permute((0, 2, 1, 3))?.contiguous()?;
+    let kp = k.permute((0, 2, 1, 3))?.contiguous()?;
+    let attn = (qp.matmul(&kp.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+    let maskb = mask.broadcast_as((b, h, sq, skv))?;
+    let attn = (attn + maskb)?;
     let sinkv = sink.reshape((1, h, 1, 1))?.expand((b, h, sq, 1))?;
     let combined = Tensor::cat(&[&attn, &sinkv], 3)?;
-    let maxv = combined.max(D::Minus1)?;
+    let maxv = combined.max(D::Minus1)?.unsqueeze(3)?.broadcast_as((b, h, sq, skv + 1))?;
     let combined = (combined - maxv)?;
     let probs = candle_nn::ops::softmax(&combined, D::Minus1)?;
     let scores = probs.narrow(3, 0, skv)?;
-    let vp = v.permute((0, 2, 1, 3))?;
-    let out = scores.matmul(&vp)?;
+    let vp = v.permute((0, 2, 1, 3))?.contiguous()?;
+    let out = scores.contiguous()?.matmul(&vp)?;
     Ok(out.permute((0, 2, 1, 3))?.to_dtype(in_dtype)?)
 }
 

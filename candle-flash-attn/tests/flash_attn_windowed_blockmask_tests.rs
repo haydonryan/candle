@@ -37,22 +37,23 @@ fn eager_ref(
         .reshape((b, skv, h, d))?;
 
     // attn = (Q @ K^T) * scale  -> [B, H, Sq, Skv]
-    let qp = q.permute((0, 2, 1, 3))?;
-    let kp = k.permute((0, 2, 1, 3))?;
-    let attn = (qp.matmul(&kp.transpose(2, 3)?)? * scale as f64)?;
-    let attn = (attn + mask)?;
+    let qp = q.permute((0, 2, 1, 3))?.contiguous()?;
+    let kp = k.permute((0, 2, 1, 3))?.contiguous()?;
+    let attn = (qp.matmul(&kp.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+    let maskb = mask.broadcast_as((b, h, sq, skv))?;
+    let attn = (attn + maskb)?;
 
     // sink column appended on the KV axis
     let sinkv = sink.reshape((1, h, 1, 1))?.expand((b, h, sq, 1))?;
     let combined = Tensor::cat(&[&attn, &sinkv], 3)?; // [B, H, Sq, Skv+1]
 
-    let maxv = combined.max(D::Minus1)?;
+    let maxv = combined.max(D::Minus1)?.unsqueeze(3)?.broadcast_as((b, h, sq, skv + 1))?;
     let combined = (combined - maxv)?;
     let probs = candle_nn::ops::softmax(&combined, D::Minus1)?;
     let scores = probs.narrow(3, 0, skv)?; // drop sink column
 
-    let vp = v.permute((0, 2, 1, 3))?; // [B, H, Skv, D]
-    let out = scores.matmul(&vp)?; // [B, H, Sq, D]
+    let vp = v.permute((0, 2, 1, 3))?.contiguous()?; // [B, H, Skv, D]
+    let out = scores.contiguous()?.matmul(&vp)?; // [B, H, Sq, D]
     let out = out.permute((0, 2, 1, 3))?; // [B, Sq, H, D]
     Ok(out.to_dtype(in_dtype)?)
 }
