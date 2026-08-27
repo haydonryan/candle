@@ -457,6 +457,27 @@ impl DeepseekV4RotaryEmbedding {
         let rotated = candle_nn::rotary_emb::rope_i(&rope_f, &cos, &sin)?.to_dtype(x.dtype())?;
         Tensor::cat(&[nope, rotated], D::Minus1)
     }
+
+    /// Apply RoPE to the trailing `rope_dim` slice of a `(b, h, t, head_dim)`
+    /// tensor using explicit per-position indices (for compressed KV entries
+    /// whose absolute positions are strided by `compress_rate`).
+    pub fn forward_at_positions(
+        &self,
+        x: &Tensor,
+        variant: RopeVariant,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let (_, _, _, head_dim) = x.dims4()?;
+        let nope_dim = head_dim - self.rope_dim;
+        let table = self.table(variant);
+        let nope = x.narrow(D::Minus1, 0, nope_dim)?;
+        let rope = x.narrow(D::Minus1, nope_dim, self.rope_dim)?;
+        let cos = table.cos.index_select(positions, 0)?.contiguous()?;
+        let sin = table.sin.index_select(positions, 0)?.contiguous()?;
+        let rope_f = rope.to_dtype(DType::F32)?.contiguous()?;
+        let rotated = candle_nn::rotary_emb::rope_i(&rope_f, &cos, &sin)?.to_dtype(x.dtype())?;
+        Tensor::cat(&[nope, rotated], D::Minus1)
+    }
 }
 
 /// Sinkhorn double-normalization (DeepSeek-V4 HC `comb`).
@@ -509,6 +530,7 @@ pub struct DeepseekV4Attention {
     softmax_scale: f64,
     sliding_window: usize,
     kv_cache: Option<Tensor>,
+    compressor: Option<DeepseekV4CSACompressor>,
     cfg: DeepseekV4Config,
 }
 
@@ -544,6 +566,11 @@ impl DeepseekV4Attention {
             vb.pp("o_b_proj"),
         )?;
         let sinks = vb.get((num_heads,), "sinks")?;
+        let compressor = if cfg.layer_types[layer_idx] == LayerType::CompressedSparseAttention {
+            Some(DeepseekV4CSACompressor::new(cfg, vb.pp("compressor"))?)
+        } else {
+            None
+        };
         Ok(Self {
             q_a_proj,
             q_a_norm,
@@ -559,12 +586,16 @@ impl DeepseekV4Attention {
             softmax_scale: (head_dim as f64).powf(-0.5),
             sliding_window: cfg.sliding_window,
             kv_cache: None,
+            compressor,
             cfg: cfg.clone(),
         })
     }
 
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        if let Some(c) = &mut self.compressor {
+            c.clear_cache();
+        }
     }
 
     /// Sliding-window causal additive mask over `(q_len, kv_len)`.
@@ -646,11 +677,31 @@ impl DeepseekV4Attention {
         let kv_len = k.dim(2)?;
         let prev_len = kv_len - seq_len;
 
+        // CSA layer: run the compressor, append the long-range compressed KV
+        // entries to the sliding window and extend the mask with its block_bias.
+        let (k, v, mask) = match &mut self.compressor {
+            None => {
+                let mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
+                (k, v, mask)
+            }
+            Some(comp) => {
+                let (compressed_kv, block_bias) = comp.forward(xs, &q_residual, seqlen_offset)?;
+                let k = Tensor::cat(&[k.clone(), compressed_kv.clone()], 2)?;
+                let v = Tensor::cat(&[v, compressed_kv], 2)?;
+                let sliding = self
+                    .sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?
+                    .broadcast_as((bs, 1, seq_len, kv_len))?;
+                let mask = Tensor::cat(&[sliding, block_bias], 3)?;
+                (k, v, mask)
+            }
+        };
+
+        let kv_len = k.dim(2)?;
+
         // Single shared KV head is broadcast to every query head for the bmm.
         let k = k.broadcast_as((bs, num_heads, kv_len, head_dim))?;
         let v = v.broadcast_as((bs, num_heads, kv_len, head_dim))?;
         let att = (q.contiguous()?.matmul(&k.t()?.contiguous()?)? * self.softmax_scale)?;
-        let mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
         let att = att.broadcast_add(&mask)?;
 
         // Per-head learnable sink appended pre-softmax, dropped after.
@@ -681,6 +732,475 @@ impl DeepseekV4Attention {
         let grouped = self.o_a_proj.forward(&grouped)?;
         let grouped = grouped.reshape((bs, seq_len, self.cfg.o_groups * self.cfg.o_lora_rank))?;
         self.o_b_proj.forward(&grouped)
+    }
+}
+
+/// Per-row top-k along the last dim, sorted descending (largest first).
+/// Returns the indices of the `k` largest values of each row.
+fn topk_last_dim(x: &Tensor, k: usize) -> Result<Tensor> {
+    let sorted = x.contiguous()?.arg_sort_last_dim(false)?;
+    sorted
+        .narrow(D::Minus1, 0, k)?
+        .contiguous()?
+        .to_dtype(DType::I64)
+}
+
+/// Persistent CSA compression state shared by the outer compressor and the
+/// indexer (mirrors `DeepseekV4CSACache`'s `"compressor"`/`"indexer"` entries).
+///
+/// Tracks the per-name buffer of un-consumed source-token projections, the
+/// running list of compressed KV entries emitted so far, the window count, and
+/// the previous window's Ca overlap slice (carried across forward calls so the
+/// first window of the next call can fold in the prior window's Ca series).
+#[derive(Debug, Clone)]
+pub struct CsaCompressionState {
+    buffer_kv: Option<Tensor>,
+    buffer_gate: Option<Tensor>,
+    compressed_kv: Option<Tensor>,
+    entry_count: usize,
+    overlap_kv: Option<Tensor>,
+    overlap_gate: Option<Tensor>,
+}
+
+impl Default for CsaCompressionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CsaCompressionState {
+    pub fn new() -> Self {
+        Self {
+            buffer_kv: None,
+            buffer_gate: None,
+            compressed_kv: None,
+            entry_count: 0,
+            overlap_kv: None,
+            overlap_gate: None,
+        }
+    }
+
+    /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
+    fn running_compressed(&self, device: &Device, head_dim: usize) -> Result<Tensor> {
+        match &self.compressed_kv {
+            Some(c) => Ok(c.clone()),
+            None => Tensor::zeros((1, 0, head_dim), DType::F32, device),
+        }
+    }
+
+    /// `store_compression_weights`: fold new projections into the buffer, peel
+    /// off the longest window-aligned prefix, keep the remainder buffered, and
+    /// return `(chunk_kv, chunk_gate, first_window_position)`.
+    fn store(
+        &mut self,
+        kv: &Tensor,
+        gate: &Tensor,
+        compress_rate: usize,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let first_window_position = self.entry_count * compress_rate;
+        let (kv, gate) = match (&self.buffer_kv, &self.buffer_gate) {
+            (Some(bk), Some(bg)) => (Tensor::cat(&[bk, kv], 1)?, Tensor::cat(&[bg, gate], 1)?),
+            _ => (kv.clone(), gate.clone()),
+        };
+        let len = kv.dim(1)?;
+        let usable = (len / compress_rate) * compress_rate;
+        let rem = len - usable;
+        if rem > 0 {
+            self.buffer_kv = Some(kv.narrow(1, usable, rem)?);
+            self.buffer_gate = Some(gate.narrow(1, usable, rem)?);
+        } else {
+            self.buffer_kv = None;
+            self.buffer_gate = None;
+        }
+        let chunk_kv = kv.narrow(1, 0, usable)?;
+        let chunk_gate = gate.narrow(1, 0, usable)?;
+        Ok((chunk_kv, chunk_gate, first_window_position))
+    }
+
+    /// `update_overlap_state`: return the previous window's Ca slice (zero-kv /
+    /// `-inf`-gate on the first call) and persist the current chunk's last-window
+    /// Ca slice for the next forward call.
+    fn update_overlap(&mut self, ca_kv: &Tensor, ca_gate: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (prior_kv, prior_gate) = (self.overlap_kv.take(), self.overlap_gate.take());
+        let batch = ca_kv.dim(0)?;
+        let rate = ca_kv.dim(2)?;
+        let head_dim = ca_kv.dim(3)?;
+        let n_windows = ca_kv.dim(1)?;
+        let device = ca_kv.device();
+        let prior_kv = match prior_kv {
+            Some(p) => p,
+            None => Tensor::zeros((batch, rate, head_dim), ca_kv.dtype(), device)?,
+        };
+        let prior_gate = match prior_gate {
+            Some(p) => p,
+            None => Tensor::full(f32::NEG_INFINITY, (batch, rate, head_dim), device)?,
+        };
+        let last_kv = ca_kv
+            .narrow(1, n_windows - 1, 1)?
+            .squeeze(1)?
+            .contiguous()?;
+        let last_gate = ca_gate
+            .narrow(1, n_windows - 1, 1)?
+            .squeeze(1)?
+            .contiguous()?;
+        self.overlap_kv = Some(last_kv);
+        self.overlap_gate = Some(last_gate);
+        Ok((prior_kv, prior_gate))
+    }
+
+    /// Feed new `kv`/`gate` source projections (shape `[B, S, 2*head_dim]`),
+    /// compress every complete window into one entry via the Ca/Cb overlap
+    /// layout, apply compress-RoPE at the strided absolute positions, append to
+    /// the running compressed KV, and return `(running_compressed, n_new)`.
+    #[allow(clippy::too_many_arguments)]
+    fn compress(
+        &mut self,
+        kv: &Tensor,
+        gate: &Tensor,
+        position_bias: &Tensor,
+        compress_rate: usize,
+        head_dim: usize,
+        kv_norm: &RmsNorm,
+        rotary_emb: &DeepseekV4RotaryEmbedding,
+    ) -> Result<(Tensor, usize)> {
+        let (chunk_kv, chunk_gate, first_window_position) = self.store(kv, gate, compress_rate)?;
+        let batch = chunk_kv.dim(0)?;
+        let len = chunk_kv.dim(1)?;
+        let n_windows = len / compress_rate;
+        if n_windows == 0 {
+            return Ok((self.running_compressed(chunk_kv.device(), head_dim)?, 0));
+        }
+        let feat = 2 * head_dim;
+        let chunk_kv = chunk_kv.reshape((batch, n_windows, compress_rate, feat))?;
+        let chunk_gate = chunk_gate
+            .reshape((batch, n_windows, compress_rate, feat))?
+            .broadcast_add(position_bias)?;
+        // Ca = [..., :head_dim] (contributes to the *next* window's entry),
+        // Cb = [..., head_dim:] (contributes to the *current* window's entry).
+        let ca_kv = chunk_kv.narrow(3, 0, head_dim)?;
+        let ca_gate = chunk_gate.narrow(3, 0, head_dim)?;
+        let cb_kv = chunk_kv.narrow(3, head_dim, head_dim)?;
+        let cb_gate = chunk_gate.narrow(3, head_dim, head_dim)?;
+
+        // First window's Ca half comes from the previous forward call's overlap
+        // (zero-kv / -inf-gate on the very first call -> softmax weight 0).
+        let (prior_kv, prior_gate) = self.update_overlap(&ca_kv, &ca_gate)?;
+        let ca_full_kv = if n_windows > 1 {
+            Tensor::cat(
+                &[prior_kv.unsqueeze(1)?, ca_kv.narrow(1, 0, n_windows - 1)?],
+                1,
+            )?
+        } else {
+            prior_kv.unsqueeze(1)?
+        };
+        let ca_full_gate = if n_windows > 1 {
+            Tensor::cat(
+                &[
+                    prior_gate.unsqueeze(1)?,
+                    ca_gate.narrow(1, 0, n_windows - 1)?,
+                ],
+                1,
+            )?
+        } else {
+            prior_gate.unsqueeze(1)?
+        };
+
+        // Lay out `[B, n_win, 2*rate, head_dim]`: Cb (current window) in the
+        // second half, Ca of the previous window in the first half.
+        let new_kv = Tensor::cat(&[ca_full_kv, cb_kv], 2)?;
+        let new_gate = Tensor::cat(&[ca_full_gate, cb_gate], 2)?;
+        // Softmax in fp32 for stability, then gated weighted sum over width 2m.
+        let gate_softmax = candle_nn::ops::softmax(&new_gate.to_dtype(DType::F32)?, 2)?
+            .to_dtype(chunk_kv.dtype())?;
+        let summed = (new_kv * gate_softmax)?.sum(2)?; // [B, n_win, head_dim]
+        let compressed = kv_norm.forward(&summed)?; // [B, n_win, head_dim]
+
+        // Compress-RoPE at `i * rate + first_window_position` for each new entry.
+        let positions: Vec<u32> = (0..n_windows)
+            .map(|w| (w * compress_rate + first_window_position) as u32)
+            .collect();
+        let positions = Tensor::from_vec(positions, (n_windows,), chunk_kv.device())?;
+        let compressed = compressed.unsqueeze(1)?; // [B, 1, n_win, head_dim]
+        let compressed = rotary_emb
+            .forward_at_positions(&compressed, RopeVariant::Compress, &positions)?
+            .squeeze(1)?; // [B, n_win, head_dim]
+
+        // Append to the running compressed KV and bump the window count.
+        let running = match &self.compressed_kv {
+            None => compressed.clone(),
+            Some(old) => Tensor::cat(&[old, &compressed], 1)?,
+        };
+        self.compressed_kv = Some(running.clone());
+        self.entry_count += n_windows;
+        Ok((running, n_windows))
+    }
+}
+
+/// Lightning-indexer scoring head: `∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)`.
+pub struct DeepseekV4IndexerScorer {
+    softmax_scale: f64,
+    weights_scaling: f64,
+    weights_proj: Linear,
+}
+
+impl DeepseekV4IndexerScorer {
+    fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            softmax_scale: (cfg.index_head_dim as f64).powf(-0.5),
+            weights_scaling: (cfg.index_n_heads as f64).powf(-0.5),
+            weights_proj: candle_nn::linear_no_bias(
+                cfg.hidden_size,
+                cfg.index_n_heads,
+                vb.pp("weights_proj"),
+            )?,
+        })
+    }
+
+    /// `q` is `[B, S, H, D]` (post-RoPE), `compressed_kv` is `[B, T, D]`.
+    /// Returns `[B, S, T]`.
+    fn forward(
+        &self,
+        q: &Tensor,
+        compressed_kv: &Tensor,
+        hidden_states: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, _h, _d) = q.dims4()?;
+        let d = compressed_kv.dim(2)?;
+        let t = compressed_kv.dim(1)?;
+        // Broadcast the single KV head to the query batch/seq dims before matmul.
+        let ck = compressed_kv
+            .transpose(1, 2)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, seq_len, d, t))?; // [B, S, D, T]
+        let scores = q.to_dtype(DType::F32)?.matmul(&ck.to_dtype(DType::F32)?)?; // [B,S,H,T]
+        let scores = (scores.relu()? * self.softmax_scale)?;
+        let weights = (self
+            .weights_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?
+            * self.weights_scaling)?; // [B, S, H]
+        let weights = weights.unsqueeze(3)?; // [B, S, H, 1]
+        scores.broadcast_mul(&weights)?.sum(2)
+    }
+}
+
+/// Lightning Indexer (paper §2.3.1, eqs. 13-17): per-query top-`index_topk`
+/// compressed entries. Runs its own scaled-down compressor at `index_head_dim`
+/// over the same windows as the outer CSA compressor, then scores queries with
+/// `∑_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)` and returns the top-`index_topk`
+/// compressed indices per query, with `-1` sentinels for invalid (future /
+/// not-yet-ready) picks.
+pub struct DeepseekV4Indexer {
+    compress_rate: usize,
+    num_heads: usize,
+    head_dim: usize,
+    index_topk: usize,
+    kv_proj: Linear,
+    gate_proj: Linear,
+    position_bias: Tensor,
+    kv_norm: RmsNorm,
+    q_b_proj: Linear,
+    rotary_emb: Arc<DeepseekV4RotaryEmbedding>,
+    scorer: DeepseekV4IndexerScorer,
+    state: CsaCompressionState,
+}
+
+impl DeepseekV4Indexer {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let head_dim = cfg.index_head_dim;
+        Ok(Self {
+            compress_rate: cfg.compress_rates.compressed_sparse_attention,
+            num_heads: cfg.index_n_heads,
+            head_dim,
+            index_topk: cfg.index_topk,
+            kv_proj: candle_nn::linear_no_bias(cfg.hidden_size, 2 * head_dim, vb.pp("kv_proj"))?,
+            gate_proj: candle_nn::linear_no_bias(
+                cfg.hidden_size,
+                2 * head_dim,
+                vb.pp("gate_proj"),
+            )?,
+            position_bias: vb.get(
+                (cfg.compress_rates.compressed_sparse_attention, 2 * head_dim),
+                "position_bias",
+            )?,
+            kv_norm: rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("kv_norm"))?,
+            q_b_proj: candle_nn::linear_no_bias(
+                cfg.q_lora_rank,
+                cfg.index_n_heads * head_dim,
+                vb.pp("q_b_proj"),
+            )?,
+            rotary_emb: Arc::new(DeepseekV4RotaryEmbedding::new(cfg, vb.device())?),
+            scorer: DeepseekV4IndexerScorer::new(cfg, vb.pp("scorer"))?,
+            state: CsaCompressionState::new(),
+        })
+    }
+
+    /// Returns per-query top-`index_topk` compressed indices `[B, S, k]` (i64),
+    /// with `-1` marking picks that point past the causal threshold.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Tensor,
+        q_residual: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, _) = hidden_states.dims3()?;
+        let device = hidden_states.device();
+        let kv = self.kv_proj.forward(hidden_states)?; // [B, S, 2*ihd]
+        let gate = self.gate_proj.forward(hidden_states)?;
+        let (compressed_kv, _n) = self.state.compress(
+            &kv,
+            &gate,
+            &self.position_bias,
+            self.compress_rate,
+            self.head_dim,
+            &self.kv_norm,
+            &self.rotary_emb,
+        )?;
+        // compressed_kv: [B, T, index_head_dim]
+
+        // Query: q_b(q_residual) -> [B, S, H, D], compress-RoPE at position_ids.
+        let q = self
+            .q_b_proj
+            .forward(q_residual)?
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?; // [B, H, S, D]
+        let q = self
+            .rotary_emb
+            .forward(&q, RopeVariant::Compress, seqlen_offset)?;
+        let q = q.transpose(1, 2)?; // [B, S, H, D]
+
+        let index_scores = self.scorer.forward(&q, &compressed_kv, hidden_states)?; // [B, S, T]
+        let compressed_len = compressed_kv.dim(1)?;
+        let top_k = self.index_topk.min(compressed_len);
+        if compressed_len == 0 || top_k == 0 {
+            return Tensor::zeros((batch, seq_len, 0), DType::I64, device);
+        }
+
+        // Query `t` may only attend to compressed entries `w` with `t > w*rate`.
+        let threshold: Vec<f32> = (0..seq_len)
+            .map(|t| ((seqlen_offset + t + 1) / self.compress_rate) as f32)
+            .collect();
+        let threshold =
+            Tensor::from_vec(threshold, (1, seq_len), device)?.broadcast_as((batch, seq_len))?;
+        let entry = Tensor::arange(0u32, compressed_len as u32, device)?.to_dtype(DType::F32)?;
+        let entry_b = entry.reshape((1, 1, compressed_len))?.broadcast_as((
+            batch,
+            seq_len,
+            compressed_len,
+        ))?;
+        let thresh_b = threshold.reshape((batch, seq_len, 1))?.broadcast_as((
+            batch,
+            seq_len,
+            compressed_len,
+        ))?;
+        let future_mask = entry_b.ge(&thresh_b)?; // [B, S, T]
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, compressed_len), device)?;
+        let masked = future_mask.where_cond(&neg_inf, &index_scores)?;
+        let topk_indices = topk_last_dim(&masked, top_k)?; // [B, S, k]
+
+        // Picks that still point past the threshold are invalid -> `-1` sentinel.
+        let thresh_k = threshold
+            .reshape((batch, seq_len, 1))?
+            .broadcast_as((batch, seq_len, top_k))?;
+        let invalid = topk_indices.to_dtype(DType::F32)?.ge(&thresh_k)?;
+        let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), device)?;
+        invalid.where_cond(&minus_one, &topk_indices)
+    }
+}
+
+/// Compressed Sparse Attention compressor (paper §2.3.1, eqs. 9-17). Compresses
+/// every `compress_rate` source tokens into a single KV entry via the Ca/Cb
+/// two-series overlap layout and runs a Lightning Indexer on top that scores
+/// queries against the compressed KV to gather the per-query top-`index_topk`
+/// entries. Produces `(compressed_kv [B, 1, T, head_dim], block_bias [B, 1, S, T])`.
+pub struct DeepseekV4CSACompressor {
+    compress_rate: usize,
+    head_dim: usize,
+    kv_proj: Linear,
+    gate_proj: Linear,
+    position_bias: Tensor,
+    kv_norm: RmsNorm,
+    rotary_emb: Arc<DeepseekV4RotaryEmbedding>,
+    indexer: DeepseekV4Indexer,
+    state: CsaCompressionState,
+}
+
+impl DeepseekV4CSACompressor {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let head_dim = cfg.head_dim;
+        let compress_rate = cfg.compress_rates.compressed_sparse_attention;
+        Ok(Self {
+            compress_rate,
+            head_dim,
+            kv_proj: candle_nn::linear_no_bias(cfg.hidden_size, 2 * head_dim, vb.pp("kv_proj"))?,
+            gate_proj: candle_nn::linear_no_bias(
+                cfg.hidden_size,
+                2 * head_dim,
+                vb.pp("gate_proj"),
+            )?,
+            position_bias: vb.get((compress_rate, 2 * head_dim), "position_bias")?,
+            kv_norm: rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("kv_norm"))?,
+            rotary_emb: Arc::new(DeepseekV4RotaryEmbedding::new(cfg, vb.device())?),
+            indexer: DeepseekV4Indexer::new(cfg, vb.pp("indexer"))?,
+            state: CsaCompressionState::new(),
+        })
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.state = CsaCompressionState::new();
+        self.indexer.state = CsaCompressionState::new();
+    }
+
+    /// `hidden_states` `[B, S, hidden]`, `q_residual` `[B, S, q_lora_rank]`.
+    /// Returns `(compressed_kv [B, 1, T, head_dim], block_bias [B, 1, S, T])`.
+    pub fn forward(
+        &mut self,
+        hidden_states: &Tensor,
+        q_residual: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, seq_len, _) = hidden_states.dims3()?;
+        let device = hidden_states.device();
+        let kv = self.kv_proj.forward(hidden_states)?; // [B, S, 2*hd]
+        let gate = self.gate_proj.forward(hidden_states)?;
+        let (compressed, _n) = self.state.compress(
+            &kv,
+            &gate,
+            &self.position_bias,
+            self.compress_rate,
+            self.head_dim,
+            &self.kv_norm,
+            &self.rotary_emb,
+        )?;
+        let compressed_kv = compressed.unsqueeze(1)?; // [B, 1, T, head_dim]
+
+        // Per-query top-k picks from the Lightning Indexer.
+        let top_k_indices = self
+            .indexer
+            .forward(hidden_states, q_residual, seqlen_offset)?; // [B, S, k]
+        let compressed_len = compressed_kv.dim(2)?;
+        let top_k = top_k_indices.dim(2)?;
+        let c_len = compressed_len as i64;
+        // Safe indices: valid picks keep their index, invalid (-1) point at a
+        // padding column that is sliced off below.
+        let valid = top_k_indices.ge(0i64)?; // [B, S, k]
+        let padding = Tensor::full(c_len, (batch, seq_len, top_k), device)?;
+        let safe = valid.where_cond(&top_k_indices, &padding)?; // [B, S, k]
+
+        // block_bias: 0 where a query selected the compressed entry, -inf else.
+        let cand = Tensor::arange(0u32, compressed_len as u32, device)?
+            .to_dtype(DType::I64)?
+            .reshape((1, 1, 1, compressed_len))?;
+        let safe_b = safe
+            .unsqueeze(3)?
+            .broadcast_as((batch, seq_len, top_k, compressed_len))?;
+        let cand_b = cand.broadcast_as((batch, seq_len, top_k, compressed_len))?;
+        let eq = safe_b.eq(&cand_b)?; // [B, S, k, T]
+        let selected = eq.to_dtype(DType::F32)?.sum(2)?.gt(0f32)?; // [B, S, T]
+        let zeros = Tensor::zeros((batch, seq_len, compressed_len), DType::F32, device)?;
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, compressed_len), device)?;
+        let block_bias = selected.where_cond(&zeros, &neg_inf)?.unsqueeze(1)?; // [B, 1, S, T]
+        Ok((compressed_kv, block_bias))
     }
 }
 
@@ -1139,6 +1659,374 @@ mod tests {
         lin(&oa, &w["o_b_proj.weight"])
     }
 
+    /// Weights for the CSA compressor + indexer (keys match the sub-namespace
+    /// `DeepseekV4CSACompressor::new` expects).
+    fn csa_parity_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
+        let hd = cfg.head_dim;
+        let ihd = cfg.index_head_dim;
+        let rate = cfg.compress_rates.compressed_sparse_attention;
+        let mut m = HashMap::new();
+        m.insert(
+            "kv_proj.weight".into(),
+            det_tensor(&[2 * hd, cfg.hidden_size], 21.0),
+        );
+        m.insert(
+            "gate_proj.weight".into(),
+            det_tensor(&[2 * hd, cfg.hidden_size], 22.0),
+        );
+        m.insert("position_bias".into(), det_tensor(&[rate, 2 * hd], 23.0));
+        m.insert(
+            "kv_norm.weight".into(),
+            det_tensor(&[hd, 1], 24.0).flatten_all().unwrap(),
+        );
+        m.insert(
+            "indexer.kv_proj.weight".into(),
+            det_tensor(&[2 * ihd, cfg.hidden_size], 31.0),
+        );
+        m.insert(
+            "indexer.gate_proj.weight".into(),
+            det_tensor(&[2 * ihd, cfg.hidden_size], 32.0),
+        );
+        m.insert(
+            "indexer.position_bias".into(),
+            det_tensor(&[rate, 2 * ihd], 33.0),
+        );
+        m.insert(
+            "indexer.kv_norm.weight".into(),
+            det_tensor(&[ihd, 1], 34.0).flatten_all().unwrap(),
+        );
+        m.insert(
+            "indexer.q_b_proj.weight".into(),
+            det_tensor(&[cfg.index_n_heads * ihd, cfg.q_lora_rank], 35.0),
+        );
+        m.insert(
+            "indexer.scorer.weights_proj.weight".into(),
+            det_tensor(&[cfg.index_n_heads, cfg.hidden_size], 36.0),
+        );
+        m
+    }
+
+    /// Reference CSA compressor + indexer (transcribed from
+    /// `modeling_deepseek_v4.py` `DeepseekV4CSACompressor.forward` +
+    /// `DeepseekV4Indexer.forward`, stateless single call). Returns
+    /// `(compressed_kv [B,1,T,hd], block_bias [B,1,S,T])`.
+    fn ref_csa(
+        cfg: &DeepseekV4Config,
+        w: &HashMap<String, Tensor>,
+        rotary: &DeepseekV4RotaryEmbedding,
+        x: &Tensor,
+        q_residual: &Tensor,
+        seqlen_offset: usize,
+        overlap: &mut (Option<Tensor>, Option<Tensor>),
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, seq_len, _) = x.dims3()?;
+        let rate = cfg.compress_rates.compressed_sparse_attention;
+        let hd = cfg.head_dim;
+        let ihd = cfg.index_head_dim;
+        let dev = x.device();
+
+        // Outer compressor.
+        let kv = lin(x, &w["kv_proj.weight"])?;
+        let gate = lin(x, &w["gate_proj.weight"])?;
+        let usable = (seq_len / rate) * rate;
+        let chunk_kv = kv.narrow(1, 0, usable)?;
+        let chunk_gate = gate.narrow(1, 0, usable)?;
+        let n_windows = usable / rate;
+        let mut compressed = if n_windows > 0 {
+            let ck = chunk_kv.reshape((batch, n_windows, rate, 2 * hd))?;
+            let cg = chunk_gate
+                .reshape((batch, n_windows, rate, 2 * hd))?
+                .broadcast_add(&w["position_bias"])?;
+            let ca_kv = ck.narrow(3, 0, hd)?;
+            let ca_gate = cg.narrow(3, 0, hd)?;
+            let cb_kv = ck.narrow(3, hd, hd)?;
+            let cb_gate = cg.narrow(3, hd, hd)?;
+            let (prior_kv, prior_gate) = match overlap {
+                (Some(pk), Some(pg)) => (pk.clone(), pg.clone()),
+                _ => (
+                    Tensor::zeros((batch, rate, hd), x.dtype(), dev)?,
+                    Tensor::full(f32::NEG_INFINITY, (batch, rate, hd), dev)?,
+                ),
+            };
+            let ca_full_kv = if n_windows > 1 {
+                Tensor::cat(
+                    &[prior_kv.unsqueeze(1)?, ca_kv.narrow(1, 0, n_windows - 1)?],
+                    1,
+                )?
+            } else {
+                prior_kv.unsqueeze(1)?
+            };
+            let ca_full_gate = if n_windows > 1 {
+                Tensor::cat(
+                    &[
+                        prior_gate.unsqueeze(1)?,
+                        ca_gate.narrow(1, 0, n_windows - 1)?,
+                    ],
+                    1,
+                )?
+            } else {
+                prior_gate.unsqueeze(1)?
+            };
+            *overlap = (
+                Some(
+                    ca_kv
+                        .narrow(1, n_windows - 1, 1)?
+                        .squeeze(1)?
+                        .contiguous()?,
+                ),
+                Some(
+                    ca_gate
+                        .narrow(1, n_windows - 1, 1)?
+                        .squeeze(1)?
+                        .contiguous()?,
+                ),
+            );
+            let new_kv = Tensor::cat(&[ca_full_kv, cb_kv], 2)?;
+            let new_gate = Tensor::cat(&[ca_full_gate, cb_gate], 2)?;
+            let soft =
+                candle_nn::ops::softmax(&new_gate.to_dtype(DType::F32)?, 2)?.to_dtype(x.dtype())?;
+            let summed = (new_kv * soft)?.sum(2)?;
+            let comp = rms_w(&summed, &w["kv_norm.weight"], cfg.rms_norm_eps)?;
+            let positions: Vec<u32> = (0..n_windows).map(|ww| (ww * rate) as u32).collect();
+            let positions = Tensor::from_vec(positions, (n_windows,), dev)?;
+            let comp = rotary
+                .forward_at_positions(&comp.unsqueeze(1)?, RopeVariant::Compress, &positions)?
+                .squeeze(1)?;
+            vec![comp]
+        } else {
+            vec![]
+        };
+        let compressed_kv = if compressed.is_empty() {
+            Tensor::zeros((batch, 0, hd), x.dtype(), dev)?
+        } else {
+            compressed.remove(0)
+        };
+        let compressed_len = compressed_kv.dim(1)?;
+
+        // Indexer compressor (at index_head_dim).
+        let ikv = lin(x, &w["indexer.kv_proj.weight"])?;
+        let igate = lin(x, &w["indexer.gate_proj.weight"])?;
+        let icompressed = if n_windows > 0 {
+            let ck = ikv
+                .narrow(1, 0, usable)?
+                .reshape((batch, n_windows, rate, 2 * ihd))?;
+            let cg = igate
+                .narrow(1, 0, usable)?
+                .reshape((batch, n_windows, rate, 2 * ihd))?
+                .broadcast_add(&w["indexer.position_bias"])?;
+            let ica_kv = ck.narrow(3, 0, ihd)?;
+            let ica_gate = cg.narrow(3, 0, ihd)?;
+            let icb_kv = ck.narrow(3, ihd, ihd)?;
+            let icb_gate = cg.narrow(3, ihd, ihd)?;
+            let zero_kv = Tensor::zeros((batch, rate, ihd), x.dtype(), dev)?;
+            let neg_gate = Tensor::full(f32::NEG_INFINITY, (batch, rate, ihd), dev)?;
+            let ica_full_kv = if n_windows > 1 {
+                Tensor::cat(
+                    &[zero_kv.unsqueeze(1)?, ica_kv.narrow(1, 0, n_windows - 1)?],
+                    1,
+                )?
+            } else {
+                zero_kv.unsqueeze(1)?
+            };
+            let ica_full_gate = if n_windows > 1 {
+                Tensor::cat(
+                    &[
+                        neg_gate.unsqueeze(1)?,
+                        ica_gate.narrow(1, 0, n_windows - 1)?,
+                    ],
+                    1,
+                )?
+            } else {
+                neg_gate.unsqueeze(1)?
+            };
+            let inew_kv = Tensor::cat(&[ica_full_kv, icb_kv], 2)?;
+            let inew_gate = Tensor::cat(&[ica_full_gate, icb_gate], 2)?;
+            let isoft = candle_nn::ops::softmax(&inew_gate.to_dtype(DType::F32)?, 2)?
+                .to_dtype(x.dtype())?;
+            let isummed = (inew_kv * isoft)?.sum(2)?;
+            let icomp = rms_w(&isummed, &w["indexer.kv_norm.weight"], cfg.rms_norm_eps)?;
+            let ipositions: Vec<u32> = (0..n_windows).map(|ww| (ww * rate) as u32).collect();
+            let ipositions = Tensor::from_vec(ipositions, (n_windows,), dev)?;
+            rotary
+                .forward_at_positions(&icomp.unsqueeze(1)?, RopeVariant::Compress, &ipositions)?
+                .squeeze(1)?
+        } else {
+            Tensor::zeros((batch, 0, ihd), x.dtype(), dev)?
+        };
+
+        // Indexer query + scorer.
+        let q = lin(q_residual, &w["indexer.q_b_proj.weight"])?
+            .reshape((batch, seq_len, cfg.index_n_heads, ihd))?
+            .transpose(1, 2)?;
+        let q = rotary
+            .forward(&q, RopeVariant::Compress, seqlen_offset)?
+            .transpose(1, 2)?;
+        let (_, _, _, _d) = q.dims4()?;
+        let ck = icompressed.transpose(1, 2)?.unsqueeze(1)?.broadcast_as((
+            batch,
+            seq_len,
+            ihd,
+            icompressed.dim(1)?,
+        ))?;
+        let scores = q.to_dtype(DType::F32)?.matmul(&ck.to_dtype(DType::F32)?)?;
+        let scores = (scores.relu()? * (ihd as f64).powf(-0.5))?;
+        let wts = (lin(x, &w["indexer.scorer.weights_proj.weight"])?.to_dtype(DType::F32)?
+            * (cfg.index_n_heads as f64).powf(-0.5))?;
+        let scores = scores.broadcast_mul(&wts.unsqueeze(3)?)?.sum(2)?;
+
+        // Per-query top-k with causal + invalid clamping.
+        let icomp_len = icompressed.dim(1)?;
+        let top_k = cfg.index_topk.min(icomp_len);
+        let threshold: Vec<f32> = (0..seq_len)
+            .map(|t| ((seqlen_offset + t + 1) / rate) as f32)
+            .collect();
+        let threshold =
+            Tensor::from_vec(threshold, (1, seq_len), dev)?.broadcast_as((batch, seq_len))?;
+        let entry = Tensor::arange(0u32, icomp_len as u32, dev)?.to_dtype(DType::F32)?;
+        let entry_b = entry
+            .reshape((1, 1, icomp_len))?
+            .broadcast_as((batch, seq_len, icomp_len))?;
+        let thresh_b = threshold
+            .reshape((batch, seq_len, 1))?
+            .broadcast_as((batch, seq_len, icomp_len))?;
+        let future = entry_b.ge(&thresh_b)?;
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, icomp_len), dev)?;
+        let masked = future.where_cond(&neg_inf, &scores)?;
+        let topk = topk_last_dim(&masked, top_k)?;
+        let thresh_k = threshold
+            .reshape((batch, seq_len, 1))?
+            .broadcast_as((batch, seq_len, top_k))?;
+        let invalid = topk.to_dtype(DType::F32)?.ge(&thresh_k)?;
+        let minus_one = Tensor::full(-1i64, (batch, seq_len, top_k), dev)?;
+        let topk = invalid.where_cond(&minus_one, &topk)?;
+
+        // block_bias: 0 at valid selected compressed positions, -inf else.
+        let c_len = compressed_len as i64;
+        let valid = topk.ge(0i64)?;
+        let padding = Tensor::full(c_len, (batch, seq_len, top_k), dev)?;
+        let safe = valid.where_cond(&topk, &padding)?;
+        let cand = Tensor::arange(0u32, compressed_len as u32, dev)?
+            .to_dtype(DType::I64)?
+            .reshape((1, 1, 1, compressed_len))?;
+        let safe_b = safe
+            .unsqueeze(3)?
+            .broadcast_as((batch, seq_len, top_k, compressed_len))?;
+        let cand_b = cand.broadcast_as((batch, seq_len, top_k, compressed_len))?;
+        let eq = safe_b.eq(&cand_b)?;
+        let selected = eq.to_dtype(DType::F32)?.sum(2)?.gt(0f32)?;
+        let zeros = Tensor::zeros((batch, seq_len, compressed_len), DType::F32, dev)?;
+        let neg_inf2 = Tensor::full(f32::NEG_INFINITY, (batch, seq_len, compressed_len), dev)?;
+        let bias = selected.where_cond(&zeros, &neg_inf2)?.unsqueeze(1)?;
+        Ok((compressed_kv.unsqueeze(1)?, bias))
+    }
+
+    /// Single-layer CSA attention config (mirrors `parity_config` but the layer
+    /// is `compressed_sparse_attention`, so `DeepseekV4Attention` wires the
+    /// compressor and uses compress-RoPE).
+    fn csa_attention_config() -> DeepseekV4Config {
+        let mut cfg = parity_config();
+        cfg.layer_types = vec![LayerType::CompressedSparseAttention];
+        cfg
+    }
+
+    /// Reference CSA attention: sliding MLA path + compressor concat + block_bias
+    /// mask concat + eager attention over `[sliding | compressed]`. `cw` holds
+    /// the uncompressed sub-namespace (`kv_proj.*`, `indexer.*`) for `ref_csa`.
+    fn reference_csa_attention(
+        cfg: &DeepseekV4Config,
+        emb: &DeepseekV4RotaryEmbedding,
+        w: &HashMap<String, Tensor>,
+        cw: &HashMap<String, Tensor>,
+        x: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        let h = cfg.num_attention_heads;
+        let d = cfg.head_dim;
+        let variant = RopeVariant::Compress;
+
+        let q_res = rms_w(
+            &lin(x, &w["q_a_proj.weight"])?,
+            &w["q_a_norm.weight"],
+            cfg.rms_norm_eps,
+        )?;
+        let q = lin(&q_res, &w["q_b_proj.weight"])?
+            .reshape((bs, seq_len, h, d))?
+            .transpose(1, 2)?;
+        let q = UnweightedRMSNorm::new(cfg.rms_norm_eps).forward(&q)?;
+        let q = emb.forward(&q, variant, seqlen_offset)?;
+
+        let kv = rms_w(
+            &lin(x, &w["kv_proj.weight"])?,
+            &w["kv_norm.weight"],
+            cfg.rms_norm_eps,
+        )?
+        .reshape((bs, seq_len, 1, d))?
+        .transpose(1, 2)?;
+        let kv = emb.forward(&kv, variant, seqlen_offset)?;
+
+        // Single call, no prior sliding cache: k_sliding == current kv.
+        let kv_len = seq_len;
+        let (compressed_kv, block_bias) =
+            ref_csa(cfg, cw, emb, x, &q_res, seqlen_offset, &mut (None, None))?;
+        let k = Tensor::cat(&[kv.clone(), compressed_kv.clone()], 2)?;
+        let v = Tensor::cat(&[kv, compressed_kv], 2)?;
+        let sliding = ref_mask(seq_len, kv_len, 0, cfg.sliding_window, x.device())?
+            .broadcast_as((bs, 1, seq_len, kv_len))?;
+        let mask = Tensor::cat(&[sliding, block_bias], 3)?;
+
+        let attn = eager_op(&q, &k, &v, &w["sinks"], &mask, (d as f64).powf(-0.5))?;
+        let attn = emb.forward_conjugate(&attn, variant, seqlen_offset)?;
+        let attn = attn.transpose(1, 2)?;
+        let grouped = attn.reshape((bs, seq_len, cfg.o_groups, h * d / cfg.o_groups))?;
+        let oa =
+            GroupedLinear::new(w["o_a_proj.weight"].clone(), cfg.o_groups).forward(&grouped)?;
+        let oa = oa.reshape((bs, seq_len, cfg.o_groups * cfg.o_lora_rank))?;
+        lin(&oa, &w["o_b_proj.weight"])
+    }
+
+    #[test]
+    fn csa_attention_parity_with_transformers() -> candle::Result<()> {
+        let cfg = csa_attention_config();
+        let dev = Device::Cpu;
+        let attn_w = parity_weights(&cfg);
+        let csa_w = csa_parity_weights(&cfg);
+        let mut merged = attn_w.clone();
+        for (k, v) in &csa_w {
+            merged.insert(format!("compressor.{k}"), v.clone());
+        }
+        let vb = VarBuilder::from_tensors(merged, DType::F32, &dev);
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, vb)?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+        let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0);
+        let out = attn.forward(&x, 0)?;
+        let ref_out = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0)?;
+        assert_close(&out, &ref_out, 1e-4, "csa-attn");
+        Ok(())
+    }
+
+    #[test]
+    fn csa_compressor_indexer_parity_with_transformers() -> candle::Result<()> {
+        let cfg = parity_config();
+        let dev = Device::Cpu;
+        let weights = csa_parity_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let mut comp = DeepseekV4CSACompressor::new(&cfg, vb)?;
+        let rotary = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+
+        // Prefill of 5 tokens -> 2 complete windows (rate=2), first window has
+        // zero-kv / -inf-gate Ca (no prior overlap).
+        let x = det_tensor(&[1, 5, cfg.hidden_size], 41.0);
+        let qr = det_tensor(&[1, 5, cfg.q_lora_rank], 42.0);
+        let (ckv, bb) = comp.forward(&x, &qr, 0)?;
+        let (r_ckv, r_bb) = ref_csa(&cfg, &weights, &rotary, &x, &qr, 0, &mut (None, None))?;
+        assert_eq!(ckv.dims(), r_ckv.dims(), "compressed_kv shape");
+        assert_eq!(bb.dims(), r_bb.dims(), "block_bias shape");
+        assert_close(&ckv, &r_ckv, 1e-4, "compressed_kv");
+        assert_close(&bb, &r_bb, 1e-4, "block_bias");
+        Ok(())
+    }
+
     #[test]
     fn attention_eager_parity_with_transformers() -> candle::Result<()> {
         let cfg = parity_config();
@@ -1173,7 +2061,9 @@ mod tests {
         let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a.len(), b.len(), "{label}: length mismatch");
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            assert!((x - y).abs() < tol, "{label}[{i}]: got {x}, expected {y}");
+            // Handle NaN and infinities (e.g. -inf in block_bias) explicitly.
+            let ok = (x.is_nan() && y.is_nan()) || (x == y) || (x - y).abs() < tol;
+            assert!(ok, "{label}[{i}]: got {x}, expected {y}");
         }
     }
 }
