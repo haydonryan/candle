@@ -60,4 +60,27 @@ extern "C" {
         stream_ptr: *mut c_void,
     );
 
+    /// Custom DeepSeek V4 DSA flash kernel: QK^T*scale + heterogeneous additive mask
+    /// (sliding-window local prefix | per-query block_bias compressed suffix) + per-head
+    /// sink logit + max-subtract + softmax + drop-sink + @V. BF16 only.
+    ///
+    /// Layouts (contiguous): q/k/v [B, Sq|Skv, H|Hk, D] bf16; mask [B, 1, Sq, Skv] f32
+    /// (0/-inf); sink [H] f32. Output [B, Sq, H, D] bf16.
+    pub(crate) fn flash_attn_windowed_blockmask(
+        q_ptr: *const c_void,
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        mask_ptr: *const c_void,
+        sink_ptr: *const c_void,
+        out_ptr: *const c_void,
+        b: c_int,
+        sq: c_int,
+        skv: c_int,
+        h: c_int,
+        hk: c_int,
+        d: c_int,
+        softmax_scale: f32,
+        stream_ptr: *mut c_void,
+    );
+
 }
