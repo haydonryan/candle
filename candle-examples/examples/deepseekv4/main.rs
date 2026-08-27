@@ -68,13 +68,6 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.use_flash_attn {
-        anyhow::bail!(
-            "flash attention requires the `flash-attn` feature and a CUDA GPU; \
-             not available in this build — eager decode is used"
-        );
-    }
-
     let dir = args.model_dir;
     let config: DeepseekV4Config = {
         let config_file = dir.join("config.json");
@@ -94,7 +87,7 @@ fn main() -> Result<()> {
         DType::BF16
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let mut model = DeepseekV4ForCausalLM::new(&config, vb)?;
+    let mut model = DeepseekV4ForCausalLM::new(&config, args.use_flash_attn, vb)?;
 
     // Sampling: ArgMax (temp <= 0) or TopK/TopP/TopKThenTopP/All.
     let temperature = args.temperature.unwrap_or(0.);

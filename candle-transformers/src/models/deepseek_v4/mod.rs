@@ -1952,8 +1952,14 @@ pub struct DeepseekV4DecoderLayer {
 }
 
 impl DeepseekV4DecoderLayer {
-    pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
-        let self_attn = DeepseekV4Attention::new(cfg, layer_idx, vb.pp("self_attn"))?;
+    pub fn new(
+        cfg: &DeepseekV4Config,
+        layer_idx: usize,
+        use_flash_attn: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn =
+            DeepseekV4Attention::new(cfg, layer_idx, use_flash_attn, vb.pp("self_attn"))?;
         let mlp = DeepseekV4SparseMoeBlock::new(cfg, layer_idx, vb.pp("mlp"))?;
         let input_layernorm =
             candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -1983,7 +1989,7 @@ impl DeepseekV4DecoderLayer {
         let dtype = hidden_states.dtype();
         let (post, comb, collapsed) = self.attn_hc.forward(hidden_states)?;
         let normed = self.input_layernorm.forward(&collapsed)?;
-        let attn_output = self.self_attn.forward(&normed, seqlen_offset)?;
+        let attn_output = self.self_attn.forward(&normed, seqlen_offset, None)?;
         let hidden_states = post
             .to_dtype(dtype)?
             .unsqueeze(D::Minus1)?
@@ -2026,11 +2032,13 @@ pub struct DeepseekV4Model {
 }
 
 impl DeepseekV4Model {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &DeepseekV4Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let layers = (0..cfg.num_hidden_layers)
-            .map(|i| DeepseekV4DecoderLayer::new(cfg, i, vb.pp(format!("layers.{i}"))))
+            .map(|i| {
+                DeepseekV4DecoderLayer::new(cfg, i, use_flash_attn, vb.pp(format!("layers.{i}")))
+            })
             .collect::<Result<Vec<_>>>()?;
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let hc_head = DeepseekV4HyperHead::new(cfg, vb.pp("hc_head"))?;
@@ -2076,8 +2084,8 @@ pub struct DeepseekV4ForCausalLM {
 }
 
 impl DeepseekV4ForCausalLM {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let model = DeepseekV4Model::new(cfg, vb.pp("model"))?;
+    pub fn new(cfg: &DeepseekV4Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
+        let model = DeepseekV4Model::new(cfg, use_flash_attn, vb.pp("model"))?;
         let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         Ok(Self { model, lm_head })
     }
@@ -3261,6 +3269,102 @@ mod tests {
         Ok(())
     }
 
+    /// Flash-vs-eager parity for the DSA kernel, covering all three layer types
+    /// (sliding, CSA, HCA). Both paths run the same BF16 weights on CUDA; the
+    /// only difference is `use_flash_attn`, so a match isolates the kernel's
+    /// fused mask/sink/softmax/drop-sink math from the eager transcription.
+    ///
+    /// Requires `--features flash-attn` (pulls in `cuda`) and a CUDA device;
+    /// skipped with a warning when no GPU is present.
+    #[cfg(feature = "flash-attn")]
+    fn check_flash_eager_parity(
+        cfg: &DeepseekV4Config,
+        label: &str,
+        dev: &Device,
+    ) -> candle::Result<()> {
+        for layer in [
+            LayerType::SlidingAttention,
+            LayerType::CompressedSparseAttention,
+            LayerType::HeavilyCompressedAttention,
+        ] {
+            let mut cfg = cfg.clone();
+            cfg.layer_types = vec![layer];
+            let attn_w = parity_weights(&cfg);
+            let extra_w = match layer {
+                LayerType::CompressedSparseAttention => csa_parity_weights(&cfg),
+                LayerType::HeavilyCompressedAttention => hca_parity_weights(&cfg),
+                _ => HashMap::new(),
+            };
+            let merged: HashMap<String, Tensor> = merged_weights(&attn_w, &extra_w)
+                .into_iter()
+                .map(|(k, v)| (k, v.to_device(dev).unwrap().to_dtype(DType::BF16).unwrap()))
+                .collect();
+            let vb_eager = VarBuilder::from_tensors(merged.clone(), DType::BF16, dev);
+            let vb_flash = VarBuilder::from_tensors(merged, DType::BF16, dev);
+            let mut eager = DeepseekV4Attention::new(&cfg, 0, false, vb_eager)?;
+            let mut flash = DeepseekV4Attention::new(&cfg, 0, true, vb_flash)?;
+            let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0)
+                .to_device(dev)?
+                .to_dtype(DType::BF16)?;
+            let e = eager.forward(&x, 0, None)?.to_dtype(DType::F32)?;
+            let f = flash.forward(&x, 0, None)?.to_dtype(DType::F32)?;
+            assert_close(&e, &f, 2e-2, &format!("flash-vs-eager {layer:?} ({label})"));
+        }
+        Ok(())
+    }
+
+    /// Base head_dim 4 smoke parity.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_parity() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager parity ({e})");
+                return Ok(());
+            }
+        };
+        check_flash_eager_parity(&parity_config(), "head_dim-4", &dev)
+    }
+
+    /// Real tiny-model shape (head_dim 128, 8 heads, MQA Hkv=1).
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_parity_head_dim_128() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager parity head_dim 128 ({e})");
+                return Ok(());
+            }
+        };
+        let mut cfg = parity_config();
+        cfg.num_attention_heads = 8;
+        cfg.head_dim = 128;
+        cfg.q_lora_rank = 128;
+        cfg.o_lora_rank = 128;
+        check_flash_eager_parity(&cfg, "tiny-head_dim-128", &dev)
+    }
+
+    /// Real V4-Flash shape (head_dim 512, 64 heads, MQA Hkv=1), run on the
+    /// 96GB GPU for the flash wiring verification (story #4270).
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_parity_v4flash_512_64h() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager parity 512/64-head ({e})");
+                return Ok(());
+            }
+        };
+        let mut cfg = parity_config();
+        cfg.num_attention_heads = 64;
+        cfg.head_dim = 512;
+        cfg.q_lora_rank = 512;
+        cfg.o_lora_rank = 512;
+        check_flash_eager_parity(&cfg, "v4flash-head_dim-512-64h", &dev)
+    }
     /// Reference mHC mixer (transcribed from `modeling_deepseek_v4.py`
     /// `DeepseekV4HyperConnection.forward`): returns `(post, comb, collapsed)`.
     fn ref_hc(
@@ -3715,7 +3819,7 @@ mod tests {
         let dev = Device::Cpu;
         let weights = model_weights(&cfg);
         let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?; // [1,5]
         let logits = model.forward(&ids, 0)?;
@@ -3732,7 +3836,7 @@ mod tests {
         let dev = Device::Cpu;
         let weights = model_weights(&cfg);
         let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
 
         // Prefill of 4 tokens.
@@ -3771,7 +3875,7 @@ mod tests {
         let dev = Device::Cpu;
         let weights = model_weights(&cfg);
         let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let mut model = DeepseekV4ForCausalLM::new(&cfg, vb)?;
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
 
         let prompt = Tensor::new(&[2u32, 5, 1, 4][..], &dev)?.unsqueeze(0)?;
@@ -4033,54 +4137,6 @@ mod tests {
             (got - expected).abs() < 1e-4,
             "aux loss got {got}, expected {expected}"
         );
-    /// Flash-vs-eager parity for the DSA kernel, covering all three layer types
-    /// (sliding, CSA, HCA). Both paths run the same BF16 weights on CUDA; the
-    /// only difference is `use_flash_attn`, so a match isolates the kernel's
-    /// fused mask/sink/softmax/drop-sink math from the eager transcription.
-    ///
-    /// Requires `--features flash-attn` (pulls in `cuda`) and a CUDA device;
-    /// skipped with a warning when no GPU is present. The dedicated GPU shapes
-    /// (head_dim 128 tiny and V4-Flash 512/64-head) are validated on the 96GB
-    /// machine via `cargo test -p candle-transformers deepseek_v4 --features cuda,flash-attn`
-    /// (story #4270 verify).
-    #[cfg(feature = "flash-attn")]
-    #[test]
-    fn flash_eager_parity() -> candle::Result<()> {
-        let dev = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("no CUDA device; skipping flash-eager parity ({e})");
-                return Ok(());
-            }
-        };
-        for layer in [
-            LayerType::SlidingAttention,
-            LayerType::CompressedSparseAttention,
-            LayerType::HeavilyCompressedAttention,
-        ] {
-            let mut cfg = parity_config();
-            cfg.layer_types = vec![layer];
-            let attn_w = parity_weights(&cfg);
-            let extra_w = match layer {
-                LayerType::CompressedSparseAttention => csa_parity_weights(&cfg),
-                LayerType::HeavilyCompressedAttention => hca_parity_weights(&cfg),
-                _ => HashMap::new(),
-            };
-            let merged: HashMap<String, Tensor> = merged_weights(&attn_w, &extra_w)
-                .into_iter()
-                .map(|(k, v)| (k, v.to_device(&dev).unwrap().to_dtype(DType::BF16).unwrap()))
-                .collect();
-            let vb_eager = VarBuilder::from_tensors(merged.clone(), DType::BF16, &dev);
-            let vb_flash = VarBuilder::from_tensors(merged, DType::BF16, &dev);
-            let mut eager = DeepseekV4Attention::new(&cfg, 0, false, vb_eager)?;
-            let mut flash = DeepseekV4Attention::new(&cfg, 0, true, vb_flash)?;
-            let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0)
-                .to_device(&dev)?
-                .to_dtype(DType::BF16)?;
-            let e = eager.forward(&x, 0, None)?.to_dtype(DType::F32)?;
-            let f = flash.forward(&x, 0, None)?.to_dtype(DType::F32)?;
-            assert_close(&e, &f, 2e-2, &format!("flash-vs-eager {layer:?}"));
-        }
         Ok(())
     }
 
