@@ -600,6 +600,17 @@ fn flash_attn_blockmask(
         softmax_scale,
     )
 }
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn_blockmask(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _block_bias_mask: &Tensor,
+    _sink_logits: &Tensor,
+    _softmax_scale: f32,
+) -> Result<Tensor> {
+    unimplemented!("compile with '--features flash-attn'")
+}
 
 /// Varlen + paged DSA flash kernel wrapper for the batched continuous-batching
 /// decode path, gated by the `flash-attn` feature. Layouts: `q` `[total_q, H,
@@ -609,6 +620,7 @@ fn flash_attn_blockmask(
 /// `[total_q, max_kv]` F32 `0`/`-inf`, `sink_logits` `[H]` F32. Returns
 /// `[total_q, H, D]`.
 #[cfg(feature = "flash-attn")]
+#[allow(clippy::too_many_arguments)]
 fn flash_attn_blockmask_varlen_paged(
     q: &Tensor,
     k: &Tensor,
@@ -636,6 +648,7 @@ fn flash_attn_blockmask_varlen_paged(
 }
 
 #[cfg(not(feature = "flash-attn"))]
+#[allow(clippy::too_many_arguments)]
 fn flash_attn_blockmask_varlen_paged(
     _q: &Tensor,
     _k: &Tensor,
@@ -1035,9 +1048,8 @@ impl DeepseekV4Attention {
         let mut kv_lens: Vec<usize> = Vec::with_capacity(bs);
         let mut mask_rows: Vec<Vec<f32>> = Vec::with_capacity(bs); // [kv_len_i]
 
-        for bi in 0..bs {
+        for (bi, &pos) in positions.iter().enumerate() {
             let x = xs.narrow(0, bi, 1)?; // [1, 1, D]
-            let pos = positions[bi];
 
             // Query path.
             let q_residual = self.q_a_norm.forward(&self.q_a_proj.forward(&x)?)?; // [1,1,qrank]
@@ -1166,12 +1178,10 @@ impl DeepseekV4Attention {
         // Undo RoPE per sequence at its own position, then grouped output.
         let out = out.reshape((bs, num_heads, head_dim))?; // [B, H, D]
         let mut undid: Vec<Tensor> = Vec::with_capacity(bs);
-        for bi in 0..bs {
+        for (bi, &pos) in positions.iter().enumerate() {
             let o = out.narrow(0, bi, 1)?; // [1, H, D]
             let o = o.unsqueeze(2)?; // [1, H, 1, D]
-            let o = self
-                .rotary_emb
-                .forward_conjugate(&o, variant, positions[bi])?; // [1, H, 1, D]
+            let o = self.rotary_emb.forward_conjugate(&o, variant, pos)?; // [1, H, 1, D]
             undid.push(o.squeeze(0)?); // [H, 1, D]
         }
         let attn_out = Tensor::stack(&undid, 0)?.squeeze(2)?; // [B, H, D]
