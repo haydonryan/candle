@@ -266,10 +266,12 @@ impl GroupedLinear {
         let w = self
             .weight
             .reshape((self.n_groups, out_per_group, in_per_group))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let xr = x
             .reshape((batch, self.n_groups, in_per_group))?
-            .transpose(0, 1)?;
+            .transpose(0, 1)?
+            .contiguous()?;
         let y = xr.matmul(&w)?.transpose(0, 1)?; // (batch, n_groups, out_per_group)
         let mut out_dims = x.dims()[..ndim - 2].to_vec();
         out_dims.push(self.n_groups);
@@ -400,7 +402,34 @@ pub struct DeepseekV4RotaryEmbedding {
 
 impl DeepseekV4RotaryEmbedding {
     pub fn new(cfg: &DeepseekV4Config, dev: &Device) -> Result<Self> {
-        let rope_dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize;
+        Self::new_with_head_dim(cfg, cfg.head_dim, dev)
+    }
+
+    /// Build a rotary embedding sized for a custom `head_dim` (used by the
+    /// indexer, which runs its own scaled-down compressor at `index_head_dim`).
+    /// `rope_dim` is rounded down to even because the interleaved `rope_i`
+    /// kernel requires an even rotation width.
+    pub fn new_with_head_dim(
+        cfg: &DeepseekV4Config,
+        head_dim: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let rope_dim = (head_dim as f64 * cfg.partial_rotary_factor) as usize;
+        let rope_dim = if rope_dim.is_multiple_of(2) {
+            rope_dim
+        } else {
+            rope_dim.saturating_sub(1)
+        };
+        Self::new_with_rope_dim(cfg, rope_dim, dev)
+    }
+
+    /// Build a rotary embedding with an explicit `rope_dim` rotation width
+    /// (used by the indexer, which rotates the full `index_head_dim` slice).
+    pub fn new_with_rope_dim(
+        cfg: &DeepseekV4Config,
+        rope_dim: usize,
+        dev: &Device,
+    ) -> Result<Self> {
         let main = RopeTable::unscaled(cfg.rope_theta, rope_dim, cfg.max_position_embeddings, dev)?;
         let compress = RopeTable::yarn(cfg, rope_dim, dev)?;
         Ok(Self {
@@ -450,6 +479,9 @@ impl DeepseekV4RotaryEmbedding {
         seqlen_offset: usize,
         sin_scale: f64,
     ) -> Result<Tensor> {
+        if self.rope_dim == 0 {
+            return Ok(x.clone());
+        }
         let (_, _, seq_len, head_dim) = x.dims4()?;
         let nope_dim = head_dim - self.rope_dim;
         let table = self.table(variant);
@@ -471,6 +503,9 @@ impl DeepseekV4RotaryEmbedding {
         variant: RopeVariant,
         positions: &Tensor,
     ) -> Result<Tensor> {
+        if self.rope_dim == 0 {
+            return Ok(x.clone());
+        }
         let (_, _, _, head_dim) = x.dims4()?;
         let nope_dim = head_dim - self.rope_dim;
         let table = self.table(variant);
@@ -778,19 +813,25 @@ impl DeepseekV4Attention {
             // Single shared KV head is broadcast to every query head for the bmm.
             let k = k.broadcast_as((bs, num_heads, kv_len, head_dim))?;
             let v = v.broadcast_as((bs, num_heads, kv_len, head_dim))?;
-            let att = (q.contiguous()?.matmul(&k.t()?.contiguous()?)? * self.softmax_scale)?;
-            let att = att.broadcast_add(&mask.to_dtype(q.dtype())?)?;
+            let orig_dtype = q.dtype();
+            let qf = q.to_dtype(DType::F32)?;
+            let kf = k.to_dtype(DType::F32)?;
+            let vf = v.to_dtype(DType::F32)?;
+            let att = (qf.contiguous()?.matmul(&kf.t()?.contiguous()?)? * self.softmax_scale)?;
+            let att = att.broadcast_add(&mask.to_dtype(DType::F32)?)?;
 
             // Per-head learnable sink appended pre-softmax, dropped after.
             let sinks = self
                 .sinks
+                .to_dtype(DType::F32)?
                 .reshape((1, num_heads, 1, 1))?
                 .broadcast_as((bs, num_heads, seq_len, 1))?;
             let att = Tensor::cat(&[att, sinks], D::Minus1)?.contiguous()?;
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             let att = att.narrow(D::Minus1, 0, kv_len)?;
 
-            let attn_out = att.matmul(&v.contiguous()?)?;
+            let attn_out = att.contiguous()?.matmul(&vf.contiguous()?)?;
+            let attn_out = attn_out.to_dtype(orig_dtype)?;
 
             // K == V, so V carries RoPE on its rope slice; undo it at the query
             // positions so each KV contribution stays a function of relative distance.
@@ -858,10 +899,10 @@ impl CsaCompressionState {
     }
 
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
-    fn running_compressed(&self, device: &Device, head_dim: usize) -> Result<Tensor> {
+    fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
         match &self.compressed_kv {
             Some(c) => Ok(c.clone()),
-            None => Tensor::zeros((1, 0, head_dim), DType::F32, device),
+            None => Tensor::zeros((1, 0, head_dim), dtype, device),
         }
     }
 
@@ -910,7 +951,8 @@ impl CsaCompressionState {
         };
         let prior_gate = match prior_gate {
             Some(p) => p,
-            None => Tensor::full(f32::NEG_INFINITY, (batch, rate, head_dim), device)?,
+            None => Tensor::full(f32::NEG_INFINITY, (batch, rate, head_dim), device)?
+                .to_dtype(ca_gate.dtype())?,
         };
         let last_kv = ca_kv
             .narrow(1, n_windows - 1, 1)?
@@ -945,7 +987,10 @@ impl CsaCompressionState {
         let len = chunk_kv.dim(1)?;
         let n_windows = len / compress_rate;
         if n_windows == 0 {
-            return Ok((self.running_compressed(chunk_kv.device(), head_dim)?, 0));
+            return Ok((
+                self.running_compressed(chunk_kv.device(), head_dim, chunk_kv.dtype())?,
+                0,
+            ));
         }
         let feat = 2 * head_dim;
         let chunk_kv = chunk_kv.reshape((batch, n_windows, compress_rate, feat))?;
@@ -1106,7 +1151,11 @@ impl DeepseekV4Indexer {
                 cfg.index_n_heads * head_dim,
                 vb.pp("q_b_proj"),
             )?,
-            rotary_emb: Arc::new(DeepseekV4RotaryEmbedding::new(cfg, vb.device())?),
+            rotary_emb: Arc::new(DeepseekV4RotaryEmbedding::new_with_rope_dim(
+                cfg,
+                cfg.index_head_dim,
+                vb.device(),
+            )?),
             scorer: DeepseekV4IndexerScorer::new(cfg, vb.pp("scorer"))?,
             state: CsaCompressionState::new(),
         })
@@ -1337,10 +1386,10 @@ struct HcaCompressionState {
 
 impl HcaCompressionState {
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
-    fn running_compressed(&self, device: &Device, head_dim: usize) -> Result<Tensor> {
+    fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
         match &self.compressed_kv {
             Some(c) => Ok(c.clone()),
-            None => Tensor::zeros((1, 0, head_dim), DType::F32, device),
+            None => Tensor::zeros((1, 0, head_dim), dtype, device),
         }
     }
 
@@ -1393,7 +1442,10 @@ impl HcaCompressionState {
         let len = chunk_kv.dim(1)?;
         let n_windows = len / compress_rate;
         if n_windows == 0 {
-            return Ok((self.running_compressed(chunk_kv.device(), head_dim)?, 0));
+            return Ok((
+                self.running_compressed(chunk_kv.device(), head_dim, chunk_kv.dtype())?,
+                0,
+            ));
         }
         let chunk_kv = chunk_kv.reshape((batch, n_windows, compress_rate, head_dim))?;
         let chunk_gate = chunk_gate
@@ -2690,7 +2742,7 @@ mod tests {
                 (Some(pk), Some(pg)) => (pk.clone(), pg.clone()),
                 _ => (
                     Tensor::zeros((batch, rate, hd), x.dtype(), dev)?,
-                    Tensor::full(f32::NEG_INFINITY, (batch, rate, hd), dev)?,
+                    Tensor::full(f32::NEG_INFINITY, (batch, rate, hd), dev)?.to_dtype(x.dtype())?,
                 ),
             };
             let ca_full_kv = if n_windows > 1 {
