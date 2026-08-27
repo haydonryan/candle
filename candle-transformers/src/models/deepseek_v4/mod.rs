@@ -14,6 +14,9 @@ use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
+/// DeepSeek-V4 fp8/fp4 quantized weight loading + CPU/disk offload.
+pub mod quantized;
+
 /// Per-layer attention type used by DeepSeek-V4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
