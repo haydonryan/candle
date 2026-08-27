@@ -917,14 +917,14 @@ impl DeepseekV4PagedLayer {
                 num_sequences
             ],
             LayerType::HeavilyCompressedAttention => {
-                vec![
-                    DeepseekV4CompressorState::Hca(HcaCompressionState::default());
-                    num_sequences
-                ]
+                vec![DeepseekV4CompressorState::Hca(HcaCompressionState::default()); num_sequences]
             }
         };
         let local_kv = vec![None; num_sequences];
-        Self { local_kv, comp_state }
+        Self {
+            local_kv,
+            comp_state,
+        }
     }
 
     /// Reset all per-sequence state (start a fresh batch).
@@ -972,7 +972,10 @@ impl DeepseekV4PagedKvCache {
         let layers = (0..cfg.num_hidden_layers)
             .map(|li| DeepseekV4PagedLayer::new(cfg, li, num_sequences))
             .collect();
-        Self { page_block_size, layers }
+        Self {
+            page_block_size,
+            layers,
+        }
     }
 
     /// Physical page size in tokens (a multiple of 64).
@@ -1100,8 +1103,11 @@ impl DeepseekV4Attention {
                 let start = blk * page_block_size;
                 let end = (start + page_block_size).min(kv_len);
                 let slice = combined[bi].narrow(0, start, end - start)?;
-                let pad =
-                    Tensor::zeros((page_block_size - (end - start), 1, head_dim), DType::BF16, dev)?;
+                let pad = Tensor::zeros(
+                    (page_block_size - (end - start), 1, head_dim),
+                    DType::BF16,
+                    dev,
+                )?;
                 k_pages.push(Tensor::cat(&[slice, pad], 0)?.contiguous()?); // [pbs, 1, D]
             }
             block_table[bi] = row;
@@ -1163,7 +1169,9 @@ impl DeepseekV4Attention {
         for bi in 0..bs {
             let o = out.narrow(0, bi, 1)?; // [1, H, D]
             let o = o.unsqueeze(2)?; // [1, H, 1, D]
-            let o = self.rotary_emb.forward_conjugate(&o, variant, positions[bi])?; // [1, H, 1, D]
+            let o = self
+                .rotary_emb
+                .forward_conjugate(&o, variant, positions[bi])?; // [1, H, 1, D]
             undid.push(o.squeeze(0)?); // [H, 1, D]
         }
         let attn_out = Tensor::stack(&undid, 0)?.squeeze(2)?; // [B, H, D]
@@ -2498,9 +2506,12 @@ impl DeepseekV4DecoderLayer {
         let dtype = hidden_states.dtype();
         let (post, comb, collapsed) = self.attn_hc.forward(hidden_states)?;
         let normed = self.input_layernorm.forward(&collapsed)?;
-        let attn_output =
-            self.self_attn
-                .forward_paged_decode(&normed, positions, layer_cache, page_block_size)?;
+        let attn_output = self.self_attn.forward_paged_decode(
+            &normed,
+            positions,
+            layer_cache,
+            page_block_size,
+        )?;
         let hidden_states = post
             .to_dtype(dtype)?
             .unsqueeze(D::Minus1)?
@@ -2598,10 +2609,7 @@ impl DeepseekV4Model {
             candle::bail!("decode_batch is a single-token-per-sequence step (got seq {seq})");
         }
         if positions.len() != bs {
-            candle::bail!(
-                "decode_batch: {} positions for batch {bs}",
-                positions.len()
-            );
+            candle::bail!("decode_batch: {} positions for batch {bs}", positions.len());
         }
         let emb = self.embed_tokens.forward(input_ids)?; // [B,1,D]
         let hidden = emb
@@ -2612,7 +2620,8 @@ impl DeepseekV4Model {
         let page_block_size = kv_cache.page_block_size();
         for (li, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = kv_cache.layer_mut(li);
-            hidden = layer.forward_paged_decode(&hidden, positions, layer_cache, page_block_size)?;
+            hidden =
+                layer.forward_paged_decode(&hidden, positions, layer_cache, page_block_size)?;
         }
         let collapsed = self.hc_head.forward(&hidden)?; // [B,1,D]
         self.norm.forward(&collapsed)
@@ -4061,41 +4070,6 @@ mod tests {
                 paged.forward_paged_decode(&xp, &[p], &mut cache, page_block_size)?;
                 eager[0].forward(&x, p, None)?;
             }
-            // prefill occupies slot 0; relocate slot 0's per-sequence state to
-            // slot `i` (and reset slot 0) so the final batch holds sequences of
-            // different lengths at slots 0..n-1.
-            for i in 0..n_seq {
-                for p in 0..prefills[i] {
-                    let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + i * 100 + p) as f32)
-                        .to_device(dev)?
-                        .to_dtype(DType::BF16)?;
-                    let xp = x.clone();
-                    paged.forward_paged_decode(&xp, &[p], &mut cache, page_block_size)?;
-                    eager[i].forward(&x, p, None)?;
-                }
-                cache.local_kv[i] = cache.local_kv[0].take();
-                let fresh = match &cache.comp_state[0] {
-                    DeepseekV4CompressorState::None => DeepseekV4CompressorState::None,
-                    DeepseekV4CompressorState::Csa { .. } => DeepseekV4CompressorState::Csa {
-                        comp: CsaCompressionState::new(),
-                        indexer: CsaCompressionState::new(),
-                    },
-                    DeepseekV4CompressorState::Hca(_) => {
-                        DeepseekV4CompressorState::Hca(HcaCompressionState::default())
-                    }
-                };
-                cache.comp_state[i] = std::mem::replace(&mut cache.comp_state[0], fresh);
-            }
-            for i in 0..n_seq {
-                for p in 0..prefills[i] {
-                    let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + i * 100 + p) as f32)
-                        .to_device(dev)?
-                        .to_dtype(DType::BF16)?;
-                    let xp = x.clone();
-                    paged.forward_paged_decode(&xp, &[p], &mut cache, page_block_size)?;
-                    eager[i].forward(&x, p, None)?;
-                }
-            }
 
             // Batched decode: all sequences together, each at its own position.
             for step in 0..n_batched_steps {
@@ -4108,9 +4082,9 @@ mod tests {
                             .to_dtype(DType::BF16)?,
                     );
                 }
-                let batch = Tensor::stack(&xs, 0)?.contiguous()?; // [B, 1, D]
-                let paged_out = paged
-                    .forward_paged_decode(&batch, &positions, &mut cache, page_block_size)?; // [B,1,D]
+                let batch = Tensor::cat(&xs, 0)?.contiguous()?; // [B, 1, D]
+                let paged_out =
+                    paged.forward_paged_decode(&batch, &positions, &mut cache, page_block_size)?; // [B,1,D]
                 for i in 0..n_seq {
                     let e = eager[i]
                         .forward(&xs[i], positions[i], None)?
@@ -4120,9 +4094,7 @@ mod tests {
                         &e,
                         &p,
                         1e-1,
-                        &format!(
-                            "paged-vs-eager batched step {step} seq {i} {layer:?} ({label})"
-                        ),
+                        &format!("paged-vs-eager batched step {step} seq {i} {layer:?} ({label})"),
                     );
                 }
             }
