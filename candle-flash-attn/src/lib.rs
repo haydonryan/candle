@@ -1032,6 +1032,11 @@ pub fn flash_attn_varlen_paged_windowed(
 /// (CSA indexer / HCA causality). Both are encoded in a single materialized additive mask
 /// tensor `[B, 1, Sq, Skv]` (0 / -inf), exactly as the eager model constructs it.
 ///
+/// The kernel executes **block-sparsely**: KV columns are processed in 64-column blocks and
+/// any block whose columns are all masked (`-inf`) is skipped entirely (no QK dot, no K/V
+/// load). Since -inf columns contribute exactly 0 to the running max, denominator, and
+/// accumulator, the output is bit-identical to the dense reference while QK/V traffic scales
+/// only with the attended blocks (sliding window + selected top-k compressed blocks).
 /// # Arguments
 ///
 /// * `q` - Query tensor `(batch, seq_len_q, num_heads_q, head_size)`, BF16, contiguous.
