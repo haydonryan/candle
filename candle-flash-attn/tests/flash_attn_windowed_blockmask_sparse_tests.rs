@@ -50,7 +50,10 @@ fn eager_ref(
     let attn = (attn + maskb)?;
     let sinkv = sink.reshape((1, h, 1, 1))?.expand((b, h, sq, 1))?;
     let combined = Tensor::cat(&[&attn, &sinkv], 3)?;
-    let maxv = combined.max(D::Minus1)?.unsqueeze(3)?.broadcast_as((b, h, sq, skv + 1))?;
+    let maxv = combined
+        .max(D::Minus1)?
+        .unsqueeze(3)?
+        .broadcast_as((b, h, sq, skv + 1))?;
     let combined = (combined - maxv)?;
     let probs = candle_nn::ops::softmax(&combined, D::Minus1)?;
     let scores = probs.narrow(3, 0, skv)?;
