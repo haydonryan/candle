@@ -10,8 +10,9 @@
 //! compressor layers use `compress_rope_theta` with Yarn scaling).
 
 use candle::{DType, Device, Result, Tensor, D};
-use candle_nn::Activation;
+use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// Per-layer attention type used by DeepSeek-V4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -424,13 +425,34 @@ impl DeepseekV4RotaryEmbedding {
         variant: RopeVariant,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        self.apply(x, variant, seqlen_offset, 1.0)
+    }
+
+    /// Apply the conjugate rotation (`-sin`) at the query positions. Used to undo
+    /// the RoPE that V (==K) carries on its rope slice from the attention output.
+    pub fn forward_conjugate(
+        &self,
+        x: &Tensor,
+        variant: RopeVariant,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        self.apply(x, variant, seqlen_offset, -1.0)
+    }
+
+    fn apply(
+        &self,
+        x: &Tensor,
+        variant: RopeVariant,
+        seqlen_offset: usize,
+        sin_scale: f64,
+    ) -> Result<Tensor> {
         let (_, _, seq_len, head_dim) = x.dims4()?;
         let nope_dim = head_dim - self.rope_dim;
         let table = self.table(variant);
         let nope = x.narrow(D::Minus1, 0, nope_dim)?;
         let rope = x.narrow(D::Minus1, nope_dim, self.rope_dim)?;
-        let cos = table.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = table.sin.narrow(0, seqlen_offset, seq_len)?;
+        let cos = table.cos.narrow(0, seqlen_offset, seq_len)?.contiguous()?;
+        let sin = (table.sin.narrow(0, seqlen_offset, seq_len)? * sin_scale)?.contiguous()?;
         let rope_f = rope.to_dtype(DType::F32)?.contiguous()?;
         let rotated = candle_nn::rotary_emb::rope_i(&rope_f, &cos, &sin)?.to_dtype(x.dtype())?;
         Tensor::cat(&[nope, rotated], D::Minus1)
@@ -462,9 +484,210 @@ pub fn sqrt_softplus(xs: &Tensor) -> Result<Tensor> {
     sp.sqrt()
 }
 
+/// DeepSeek-V4 sliding-window attention (`DeepseekV4Attention`, sliding path).
+///
+/// Exact MLA math from `modeling_deepseek_v4.py`:
+/// `q_a_proj(hidden -> q_lora_rank) -> RMSNorm -> q_b_proj(-> num_heads*head_dim)
+/// -> UnweightedRMSNorm`; a single shared KV head (`num_key_value_heads=1`,
+/// K == V) via `kv_proj(hidden -> head_dim) -> RMSNorm`; partial/interleaved RoPE
+/// on the trailing `qk_rope_head_dim` slice of q and kv; a per-head learnable
+/// sink appended pre-softmax and dropped after; a grouped output `o_a_proj`
+/// (block-diagonal over `o_groups`) then `o_b_proj`; and a sliding-window KV
+/// cache that keeps the last `sliding_window - 1` tokens.
+pub struct DeepseekV4Attention {
+    q_a_proj: Linear,
+    q_a_norm: RmsNorm,
+    q_b_proj: Linear,
+    q_b_norm: UnweightedRMSNorm,
+    kv_proj: Linear,
+    kv_norm: RmsNorm,
+    o_a_proj: GroupedLinear,
+    o_b_proj: Linear,
+    sinks: Tensor,
+    rotary_emb: Arc<DeepseekV4RotaryEmbedding>,
+    rope_variant: RopeVariant,
+    softmax_scale: f64,
+    sliding_window: usize,
+    kv_cache: Option<Tensor>,
+    cfg: DeepseekV4Config,
+}
+
+impl DeepseekV4Attention {
+    pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        let rope_variant = if cfg.layer_types[layer_idx] == LayerType::SlidingAttention {
+            RopeVariant::Main
+        } else {
+            RopeVariant::Compress
+        };
+        let q_a_proj =
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.q_lora_rank, vb.pp("q_a_proj"))?;
+        let q_a_norm = rms_norm(cfg.q_lora_rank, cfg.rms_norm_eps, vb.pp("q_a_norm"))?;
+        let q_b_proj =
+            candle_nn::linear_no_bias(cfg.q_lora_rank, num_heads * head_dim, vb.pp("q_b_proj"))?;
+        let q_b_norm = UnweightedRMSNorm::new(cfg.rms_norm_eps);
+        let kv_proj = candle_nn::linear_no_bias(cfg.hidden_size, head_dim, vb.pp("kv_proj"))?;
+        let kv_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("kv_norm"))?;
+        // `o_a_proj` weight is `(o_groups * o_lora_rank, num_heads*head_dim / o_groups)`.
+        let o_a_weight = vb.get(
+            (
+                cfg.o_groups * cfg.o_lora_rank,
+                num_heads * head_dim / cfg.o_groups,
+            ),
+            "o_a_proj.weight",
+        )?;
+        let o_a_proj = GroupedLinear::new(o_a_weight, cfg.o_groups);
+        let o_b_proj = candle_nn::linear_no_bias(
+            cfg.o_groups * cfg.o_lora_rank,
+            cfg.hidden_size,
+            vb.pp("o_b_proj"),
+        )?;
+        let sinks = vb.get((num_heads,), "sinks")?;
+        Ok(Self {
+            q_a_proj,
+            q_a_norm,
+            q_b_proj,
+            q_b_norm,
+            kv_proj,
+            kv_norm,
+            o_a_proj,
+            o_b_proj,
+            sinks,
+            rotary_emb: Arc::new(DeepseekV4RotaryEmbedding::new(cfg, vb.device())?),
+            rope_variant,
+            softmax_scale: (head_dim as f64).powf(-0.5),
+            sliding_window: cfg.sliding_window,
+            kv_cache: None,
+            cfg: cfg.clone(),
+        })
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache = None;
+    }
+
+    /// Sliding-window causal additive mask over `(q_len, kv_len)`.
+    ///
+    /// Query `i` (absolute position `seqlen_offset + i`) may attend to KV `j`
+    /// (absolute position `seqlen_offset - prev_len + j`) iff the distance
+    /// `i + prev_len - j` is in `[0, sliding_window)`; everything else is `-inf`.
+    fn sliding_window_mask(
+        &self,
+        q_len: usize,
+        kv_len: usize,
+        prev_len: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let inf = f32::NEG_INFINITY;
+        let mut mask = vec![inf; q_len * kv_len];
+        for i in 0..q_len {
+            for j in 0..kv_len {
+                let d = i as isize + prev_len as isize - j as isize;
+                if d >= 0 && (d as usize) < self.sliding_window {
+                    mask[i * kv_len + j] = 0.0;
+                }
+            }
+        }
+        Tensor::from_vec(mask, (q_len, kv_len), dev)?
+            .unsqueeze(0)?
+            .unsqueeze(0)
+    }
+
+    /// Keep only the last `sliding_window - 1` tokens of the K==V cache.
+    fn trim_cache(&self, kv: &Tensor) -> Result<Tensor> {
+        let t = kv.dim(2)?;
+        let keep = self.sliding_window.saturating_sub(1).min(t);
+        if keep == t {
+            Ok(kv.clone())
+        } else {
+            kv.narrow(D::Minus2, t - keep, keep)
+        }
+    }
+
+    pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let (bs, seq_len, _) = xs.dims3()?;
+        let num_heads = self.cfg.num_attention_heads;
+        let head_dim = self.cfg.head_dim;
+        let variant = self.rope_variant;
+
+        // Query: q_a -> RMSNorm -> q_b -> UnweightedRMSNorm.
+        let q_residual = self.q_a_norm.forward(&self.q_a_proj.forward(xs)?)?;
+        let q = self
+            .q_b_proj
+            .forward(&q_residual)?
+            .reshape((bs, seq_len, num_heads, head_dim))?
+            .transpose(1, 2)?;
+        let q = self.q_b_norm.forward(&q)?;
+        let q = self.rotary_emb.forward(&q, variant, seqlen_offset)?;
+
+        // Single shared KV head (K == V).
+        let kv = self
+            .kv_norm
+            .forward(&self.kv_proj.forward(xs)?)?
+            .reshape((bs, seq_len, 1, head_dim))?
+            .transpose(1, 2)?;
+        let kv = self.rotary_emb.forward(&kv, variant, seqlen_offset)?;
+
+        // Sliding-window cache update: return `full` (prev + current) for
+        // attention, store only the last `sliding_window - 1` tokens.
+        let (k, v) = match &self.kv_cache {
+            None => {
+                self.kv_cache = Some(self.trim_cache(&kv)?);
+                (kv.clone(), kv.clone())
+            }
+            Some(prev) => {
+                let full = Tensor::cat(&[prev, &kv], 2)?;
+                self.kv_cache = Some(self.trim_cache(&full)?);
+                (full.clone(), full.clone())
+            }
+        };
+
+        let kv_len = k.dim(2)?;
+        let prev_len = kv_len - seq_len;
+
+        // Single shared KV head is broadcast to every query head for the bmm.
+        let k = k.broadcast_as((bs, num_heads, kv_len, head_dim))?;
+        let v = v.broadcast_as((bs, num_heads, kv_len, head_dim))?;
+        let att = (q.contiguous()?.matmul(&k.t()?.contiguous()?)? * self.softmax_scale)?;
+        let mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
+        let att = att.broadcast_add(&mask)?;
+
+        // Per-head learnable sink appended pre-softmax, dropped after.
+        let sinks = self
+            .sinks
+            .reshape((1, num_heads, 1, 1))?
+            .broadcast_as((bs, num_heads, seq_len, 1))?;
+        let att = Tensor::cat(&[att, sinks], D::Minus1)?.contiguous()?;
+        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let att = att.narrow(D::Minus1, 0, kv_len)?;
+
+        let attn_out = att.matmul(&v.contiguous()?)?;
+
+        // K == V, so V carries RoPE on its rope slice; undo it at the query
+        // positions so each KV contribution stays a function of relative distance.
+        let attn_out = self
+            .rotary_emb
+            .forward_conjugate(&attn_out, variant, seqlen_offset)?;
+
+        // Grouped low-rank output: o_a (block-diagonal over o_groups) then o_b.
+        let attn_out = attn_out.transpose(1, 2)?.contiguous()?; // (bs, seq_len, num_heads, head_dim)
+        let grouped = attn_out.reshape((
+            bs,
+            seq_len,
+            self.cfg.o_groups,
+            num_heads * head_dim / self.cfg.o_groups,
+        ))?;
+        let grouped = self.o_a_proj.forward(&grouped)?;
+        let grouped = grouped.reshape((bs, seq_len, self.cfg.o_groups * self.cfg.o_lora_rank))?;
+        self.o_b_proj.forward(&grouped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn sample_config_path() -> PathBuf {
@@ -695,5 +918,262 @@ mod tests {
             assert!((a - b).abs() < 1e-4, "out[{i}] got {a}, expected {b}");
         }
         Ok(())
+    }
+
+    /// Tiny config for the eager-parity test: hidden=8, heads=2, head_dim=4,
+    /// o_groups=2, sliding_window=3, partial_rotary_factor=0.5 (rope_dim=2).
+    fn parity_config() -> DeepseekV4Config {
+        serde_json::from_str(
+            r#"{
+                "vocab_size": 100, "hidden_size": 8, "moe_intermediate_size": 16,
+                "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 4, "q_lora_rank": 4, "o_lora_rank": 4, "qk_rope_head_dim": 2,
+                "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                "num_nextn_predict_layers": 0, "o_groups": 2, "num_hash_layers": 0,
+                "index_head_dim": 2, "index_n_heads": 1, "index_topk": 4, "hc_mult": 2,
+                "hc_sinkhorn_iters": 5, "hc_eps": 1e-6, "partial_rotary_factor": 0.5,
+                "sliding_window": 3, "max_position_embeddings": 8, "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
+                "attention_bias": false, "attention_dropout": 0.0, "mlp_bias": false,
+                "output_router_logits": false, "router_aux_loss_coef": 0.001, "router_jitter_noise": 0.0,
+                "swiglu_limit": 10.0, "initializer_range": 0.02, "use_cache": true,
+                "bos_token_id": 0, "eos_token_id": 1,
+                "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+                "compress_ratios": [0, 0],
+                "layer_types": ["sliding_attention", "sliding_attention"],
+                "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16,
+                                 "original_max_position_embeddings": 65536, "type": "yarn"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Deterministic weight tensor: `w[i] = sin((i + base) * 0.13) * 0.5`.
+    fn det_tensor(shape: &[usize], base: f32) -> Tensor {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 + base) * 0.13).sin() * 0.5)
+            .collect();
+        Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+    }
+
+    fn parity_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
+        let h = cfg.num_attention_heads;
+        let d = cfg.head_dim;
+        let mut m = HashMap::new();
+        m.insert(
+            "q_a_proj.weight".into(),
+            det_tensor(&[cfg.q_lora_rank, cfg.hidden_size], 1.0),
+        );
+        m.insert(
+            "q_a_norm.weight".into(),
+            det_tensor(&[cfg.q_lora_rank, 1], 2.0)
+                .flatten_all()
+                .unwrap(),
+        );
+        m.insert(
+            "q_b_proj.weight".into(),
+            det_tensor(&[h * d, cfg.q_lora_rank], 3.0),
+        );
+        m.insert(
+            "kv_proj.weight".into(),
+            det_tensor(&[d, cfg.hidden_size], 4.0),
+        );
+        m.insert(
+            "kv_norm.weight".into(),
+            det_tensor(&[d, 1], 5.0).flatten_all().unwrap(),
+        );
+        m.insert(
+            "o_a_proj.weight".into(),
+            det_tensor(&[cfg.o_groups * cfg.o_lora_rank, h * d / cfg.o_groups], 6.0),
+        );
+        m.insert(
+            "o_b_proj.weight".into(),
+            det_tensor(&[cfg.hidden_size, cfg.o_groups * cfg.o_lora_rank], 7.0),
+        );
+        m.insert(
+            "sinks".into(),
+            det_tensor(&[h, 1], 8.0).flatten_all().unwrap(),
+        );
+        m
+    }
+
+    /// Bias-free linear: `x @ w^T` with `w` shaped `(out, in)`.
+    fn lin(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let wt = w.t()?;
+        if x.rank() == 3 {
+            let (bsize, m, k) = x.dims3()?;
+            let out = wt.dim(1)?;
+            x.reshape((bsize * m, k))?
+                .matmul(&wt)?
+                .reshape((bsize, m, out))
+        } else {
+            x.matmul(&wt)
+        }
+    }
+
+    /// Weighted RMSNorm (DeepseekV4RMSNorm): `x * rsqrt(mean(x^2) + eps) * w`.
+    fn rms_w(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+        let xf = x.to_dtype(DType::F32)?;
+        let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
+        let n = (var + eps)?.sqrt()?.recip()?;
+        xf.broadcast_mul(&n)?.broadcast_mul(w)?.to_dtype(x.dtype())
+    }
+
+    /// Reference `eager_attention_forward` transcribed from
+    /// `modeling_deepseek_v4.py` L694-724: repeat_kv, `q @ k^T * scaling`,
+    /// add mask, cat per-head sink, subtract row max, softmax, drop sink, then
+    /// `attn @ v`.
+    fn eager_op(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        sinks: &Tensor,
+        mask: &Tensor,
+        scaling: f64,
+    ) -> Result<Tensor> {
+        let (b, h, sq, d) = q.dims4()?;
+        let skv = k.dim(2)?;
+        let k = k.broadcast_as((b, h, skv, d))?.contiguous()?;
+        let v = v.broadcast_as((b, h, skv, d))?.contiguous()?;
+        let attn = (q.matmul(&k.t()?)? * scaling)?.broadcast_add(mask)?;
+        let sinks = sinks.reshape((1, h, 1, 1))?.broadcast_as((b, h, sq, 1))?;
+        let combined = Tensor::cat(&[attn, sinks], D::Minus1)?;
+        let max = combined.max_keepdim(D::Minus1)?;
+        let combined = combined.broadcast_sub(&max)?;
+        let probs = candle_nn::ops::softmax_last_dim(&combined)?;
+        let scores = probs.narrow(D::Minus1, 0, skv)?;
+        scores.matmul(&v)
+    }
+
+    /// Sliding-window causal additive mask, same formula as `DeepseekV4Attention`.
+    fn ref_mask(
+        q_len: usize,
+        kv_len: usize,
+        prev_len: usize,
+        sliding_window: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let inf = f32::NEG_INFINITY;
+        let mut mask = vec![inf; q_len * kv_len];
+        for i in 0..q_len {
+            for j in 0..kv_len {
+                let d = i as isize + prev_len as isize - j as isize;
+                if d >= 0 && (d as usize) < sliding_window {
+                    mask[i * kv_len + j] = 0.0;
+                }
+            }
+        }
+        Tensor::from_vec(mask, (q_len, kv_len), dev)?
+            .unsqueeze(0)?
+            .unsqueeze(0)
+    }
+
+    fn ref_trim(kv: &Tensor, sliding_window: usize) -> Result<Tensor> {
+        let t = kv.dim(2)?;
+        let keep = sliding_window.saturating_sub(1).min(t);
+        if keep == t {
+            Ok(kv.clone())
+        } else {
+            kv.narrow(D::Minus2, t - keep, keep)
+        }
+    }
+
+    /// Independent transcription of the transformers MLA path for a sliding
+    /// layer (K == V), driven by the same weight tensors as the candle module.
+    fn reference_forward(
+        cfg: &DeepseekV4Config,
+        emb: &DeepseekV4RotaryEmbedding,
+        w: &HashMap<String, Tensor>,
+        x: &Tensor,
+        seqlen_offset: usize,
+        cache: &mut Option<Tensor>,
+    ) -> Result<Tensor> {
+        let (bs, seq_len, _) = x.dims3()?;
+        let h = cfg.num_attention_heads;
+        let d = cfg.head_dim;
+        let variant = RopeVariant::Main;
+
+        let q_res = rms_w(
+            &lin(x, &w["q_a_proj.weight"])?,
+            &w["q_a_norm.weight"],
+            cfg.rms_norm_eps,
+        )?;
+        let q = lin(&q_res, &w["q_b_proj.weight"])?
+            .reshape((bs, seq_len, h, d))?
+            .transpose(1, 2)?;
+        let q = UnweightedRMSNorm::new(cfg.rms_norm_eps).forward(&q)?;
+        let q = emb.forward(&q, variant, seqlen_offset)?;
+
+        let kv = rms_w(
+            &lin(x, &w["kv_proj.weight"])?,
+            &w["kv_norm.weight"],
+            cfg.rms_norm_eps,
+        )?
+        .reshape((bs, seq_len, 1, d))?
+        .transpose(1, 2)?;
+        let kv = emb.forward(&kv, variant, seqlen_offset)?;
+
+        let (k, v) = match cache {
+            None => {
+                *cache = Some(ref_trim(&kv, cfg.sliding_window)?);
+                (kv.clone(), kv.clone())
+            }
+            Some(prev) => {
+                let full = Tensor::cat(&[prev, &kv], 2)?;
+                *cache = Some(ref_trim(&full, cfg.sliding_window)?);
+                (full.clone(), full.clone())
+            }
+        };
+        let kv_len = k.dim(2)?;
+        let prev_len = kv_len - seq_len;
+
+        let mask = ref_mask(seq_len, kv_len, prev_len, cfg.sliding_window, x.device())?;
+        let attn = eager_op(&q, &k, &v, &w["sinks"], &mask, (d as f64).powf(-0.5))?;
+        let attn = emb.forward_conjugate(&attn, variant, seqlen_offset)?;
+        let attn = attn.transpose(1, 2)?;
+        let grouped = attn.reshape((bs, seq_len, cfg.o_groups, h * d / cfg.o_groups))?;
+        let oa =
+            GroupedLinear::new(w["o_a_proj.weight"].clone(), cfg.o_groups).forward(&grouped)?;
+        let oa = oa.reshape((bs, seq_len, cfg.o_groups * cfg.o_lora_rank))?;
+        lin(&oa, &w["o_b_proj.weight"])
+    }
+
+    #[test]
+    fn attention_eager_parity_with_transformers() -> candle::Result<()> {
+        let cfg = parity_config();
+        let dev = Device::Cpu;
+        let weights = parity_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, vb)?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+        let mut cache: Option<Tensor> = None;
+
+        let x1 = det_tensor(&[1, 5, cfg.hidden_size], 11.0);
+        let o1 = attn.forward(&x1, 0)?;
+        let r1 = reference_forward(&cfg, &emb, &weights, &x1, 0, &mut cache)?;
+        assert_close(&o1, &r1, 1e-4, "step1");
+
+        // Step 2: a two-token continuation after the cache has been trimmed.
+        let x2 = det_tensor(&[1, 2, cfg.hidden_size], 13.0);
+        let o2 = attn.forward(&x2, 5)?;
+        let r2 = reference_forward(&cfg, &emb, &weights, &x2, 5, &mut cache)?;
+        assert_close(&o2, &r2, 1e-4, "step2");
+
+        // Step 3: single-token generation off the sliding cache.
+        let x3 = det_tensor(&[1, 1, cfg.hidden_size], 17.0);
+        let o3 = attn.forward(&x3, 7)?;
+        let r3 = reference_forward(&cfg, &emb, &weights, &x3, 7, &mut cache)?;
+        assert_close(&o3, &r3, 1e-4, "step3");
+        Ok(())
+    }
+
+    fn assert_close(a: &Tensor, b: &Tensor, tol: f32, label: &str) {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((x - y).abs() < tol, "{label}[{i}]: got {x}, expected {y}");
+        }
     }
 }
