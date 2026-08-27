@@ -63,6 +63,12 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
+
+    /// Prefill only and write the prompt's logits `[1, S, vocab]` (flattened,
+    /// f32) to this JSON path, then exit. Used by the transformers-parity
+    /// harness to capture deterministic candle logits for eager/flash.
+    #[arg(long)]
+    dump_logits: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -88,6 +94,25 @@ fn main() -> Result<()> {
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let mut model = DeepseekV4ForCausalLM::new(&config, args.use_flash_attn, vb)?;
+
+    // Deterministic single-prefill logit dump for the transformers-parity harness.
+    if let Some(path) = args.dump_logits {
+        let tokens = tokenizer
+            .encode(&*args.prompt, true)
+            .map_err(E::msg)?
+            .get_ids()
+            .to_vec();
+        let prompt = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
+        let logits = model.forward(&prompt, 0)?.to_dtype(DType::F32)?; // [1, S, vocab]
+        let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+        serde_json::to_writer(
+            std::io::BufWriter::new(std::fs::File::create(&path)?),
+            &flat,
+        )
+        .map_err(E::msg)?;
+        println!("wrote {} logits to {}", flat.len(), path.display());
+        return Ok(());
+    }
 
     // Sampling: ArgMax (temp <= 0) or TopK/TopP/TopKThenTopP/All.
     let temperature = args.temperature.unwrap_or(0.);
