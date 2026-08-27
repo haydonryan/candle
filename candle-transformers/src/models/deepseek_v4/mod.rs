@@ -1195,12 +1195,14 @@ impl DeepseekV4Indexer {
             .forward(&q, RopeVariant::Compress, seqlen_offset)?;
         let q = q.transpose(1, 2)?; // [B, S, H, D]
 
-        let index_scores = self.scorer.forward(&q, &compressed_kv, hidden_states)?; // [B, S, T]
+        // No compressed entries yet (early decode): nothing to score/index.
         let compressed_len = compressed_kv.dim(1)?;
         let top_k = self.index_topk.min(compressed_len);
         if compressed_len == 0 || top_k == 0 {
             return Tensor::zeros((batch, seq_len, 0), DType::I64, device);
         }
+
+        let index_scores = self.scorer.forward(&q, &compressed_kv, hidden_states)?; // [B, S, T]
 
         // Query `t` may only attend to compressed entries `w` with `t > w*rate`.
         let threshold: Vec<f32> = (0..seq_len)
@@ -1306,6 +1308,13 @@ impl DeepseekV4CSACompressor {
             .forward(hidden_states, q_residual, seqlen_offset)?; // [B, S, k]
         let compressed_len = compressed_kv.dim(2)?;
         let top_k = top_k_indices.dim(2)?;
+        // No compressed entries yet (early decode): empty block_bias over the
+        // empty compressed suffix (avoids elementwise ops on 0-element CUDA
+        // tensors, which candle-core's CUDA kernels reject).
+        if compressed_len == 0 || top_k == 0 {
+            let empty_bb = Tensor::zeros((batch, seq_len, 0), DType::F32, device)?.unsqueeze(1)?;
+            return Ok((compressed_kv, empty_bb));
+        }
         let c_len = compressed_len as i64;
         // Safe indices: valid picks keep their index, invalid (-1) point at a
         // padding column that is sliced off below.
@@ -1538,6 +1547,12 @@ impl DeepseekV4HCACompressor {
         )?;
         let compressed_kv = compressed.unsqueeze(1)?; // [B, 1, T, head_dim]
         let compressed_len = compressed_kv.dim(2)?;
+        // No compressed entries yet (early decode): empty block_bias (avoids
+        // elementwise/to_dtype ops on 0-element CUDA tensors).
+        if compressed_len == 0 {
+            let empty_bb = Tensor::zeros((batch, seq_len, 0), DType::F32, device)?.unsqueeze(1)?;
+            return Ok((compressed_kv, empty_bb));
+        }
 
         // Causality-only block_bias: entry `w` is masked for query `t` (at
         // absolute position `seqlen_offset + t`) when `w >= (pos + 1) // rate`.
@@ -3363,6 +3378,104 @@ mod tests {
             assert_close(&e, &f, 2e-2, &format!("flash-vs-eager {layer:?} ({label})"));
         }
         Ok(())
+    }
+
+    /// Flash-vs-eager per-step decode parity for the DSA kernel, running the
+    /// full `DeepseekV4Attention` with the **incremental** compressed-KV cache:
+    /// at each step a single new token (`Sq = 1`) is fed at absolute position
+    /// `step`, exactly as the `DeepseekV4ForCausalLM::generate` loop decodes,
+    /// and the flash output must match eager at every step for all three layer
+    /// types (sliding, CSA, HCA). This is the acceptance test for decode-mode
+    /// DSA flash driven by the incremental cache + blockmask/block-sparse
+    /// kernels.
+    ///
+    /// Requires `--features flash-attn` (pulls in `cuda`) and a CUDA device;
+    /// skipped with a warning when no GPU is present.
+    #[cfg(feature = "flash-attn")]
+    fn check_flash_eager_decode_parity(
+        cfg: &DeepseekV4Config,
+        label: &str,
+        dev: &Device,
+        n_steps: usize,
+    ) -> candle::Result<()> {
+        for layer in [
+            LayerType::SlidingAttention,
+            LayerType::CompressedSparseAttention,
+            LayerType::HeavilyCompressedAttention,
+        ] {
+            let mut cfg = cfg.clone();
+            cfg.layer_types = vec![layer];
+            let attn_w = parity_weights(&cfg);
+            let extra_w = match layer {
+                LayerType::CompressedSparseAttention => csa_parity_weights(&cfg),
+                LayerType::HeavilyCompressedAttention => hca_parity_weights(&cfg),
+                _ => HashMap::new(),
+            };
+            let merged: HashMap<String, Tensor> = merged_weights(&attn_w, &extra_w)
+                .into_iter()
+                .map(|(k, v)| (k, v.to_device(dev).unwrap().to_dtype(DType::BF16).unwrap()))
+                .collect();
+            let vb_eager = VarBuilder::from_tensors(merged.clone(), DType::BF16, dev);
+            let vb_flash = VarBuilder::from_tensors(merged, DType::BF16, dev);
+            let mut eager = DeepseekV4Attention::new(&cfg, 0, false, vb_eager)?;
+            let mut flash = DeepseekV4Attention::new(&cfg, 0, true, vb_flash)?;
+            // Per-step decode: Sq=1 at running absolute position, incremental cache.
+            for step in 0..n_steps {
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (51 + step) as f32)
+                    .to_device(dev)?
+                    .to_dtype(DType::BF16)?;
+                let e = eager.forward(&x, step, None)?.to_dtype(DType::F32)?;
+                let f = flash.forward(&x, step, None)?.to_dtype(DType::F32)?;
+                assert_close(
+                    &e,
+                    &f,
+                    1e-1,
+                    &format!("flash-vs-eager decode step {step} {layer:?} ({label})"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-step decode parity at the tiny-model shape (head_dim 128, 8 heads,
+    /// MQA Hkv=1), 300 decode steps through the incremental cache.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_decode_parity_head_dim_128() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager decode parity head_dim 128 ({e})");
+                return Ok(());
+            }
+        };
+        let mut cfg = decode_parity_config();
+        cfg.num_attention_heads = 8;
+        cfg.head_dim = 128;
+        cfg.q_lora_rank = 128;
+        cfg.o_lora_rank = 128;
+        check_flash_eager_decode_parity(&cfg, "tiny-head_dim-128", &dev, 300)
+    }
+
+    /// Per-step decode parity at the real V4-Flash shape (head_dim 512, 64
+    /// heads, MQA Hkv=1), 300 decode steps through the incremental cache on
+    /// the 96GB GPU.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_decode_parity_v4flash_512_64h() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager decode parity 512/64-head ({e})");
+                return Ok(());
+            }
+        };
+        let mut cfg = decode_parity_config();
+        cfg.num_attention_heads = 64;
+        cfg.head_dim = 512;
+        cfg.q_lora_rank = 512;
+        cfg.o_lora_rank = 512;
+        check_flash_eager_decode_parity(&cfg, "v4flash-head_dim-512-64h", &dev, 300)
     }
 
     /// Base head_dim 4 smoke parity.

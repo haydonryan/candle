@@ -83,4 +83,30 @@ extern "C" {
         stream_ptr: *mut c_void,
     );
 
+    /// Custom DeepSeek V4 DSA flash kernel for variable-length (continuous-batching)
+    /// batches with a paged K/V cache. Layouts (contiguous): q/out [total_q, H, D]
+    /// bf16; k/v [num_blocks, page_block_size, Hk, D] bf16; cu_seqlens_q/k [B+1] i32;
+    /// block_table [B, max_blocks] i32; mask [total_q, max_kv] f32 (0/-inf); sink [H] f32.
+    pub(crate) fn flash_attn_varlen_paged_blockmask(
+        q_ptr: *const c_void,
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        cu_seqlens_q_ptr: *const c_int,
+        cu_seqlens_k_ptr: *const c_int,
+        block_table_ptr: *const c_int,
+        mask_ptr: *const c_void,
+        sink_ptr: *const c_void,
+        out_ptr: *const c_void,
+        b: c_int,
+        total_q: c_int,
+        max_kv: c_int,
+        h: c_int,
+        hk: c_int,
+        d: c_int,
+        page_block_size: c_int,
+        max_blocks: c_int,
+        softmax_scale: f32,
+        stream_ptr: *mut c_void,
+    );
+
 }
