@@ -9,7 +9,8 @@
 //! per-layer compression rate and RoPE type (main layers use `rope_theta`,
 //! compressor layers use `compress_rope_theta` with Yarn scaling).
 
-use candle::{DType, Device, Result, Tensor, D};
+use super::deepseek2::{BincountOp, NonZeroOp, TopKLastDimOp};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -1434,6 +1435,313 @@ impl DeepseekV4HCACompressor {
     }
 }
 
+/// Shared-experts MLP (`DeepseekV4MLP`): gate/up/down linear layers with swiGLU
+/// clamps matching `modeling_deepseek_v4.py` (`gate.clamp(max=limit)`,
+/// `up.clamp(min=-limit, max=limit)`).
+pub struct DeepseekV4Mlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    act: Activation,
+    limit: f64,
+}
+
+impl DeepseekV4Mlp {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let h = cfg.hidden_size;
+        let int = cfg.moe_intermediate_size;
+        Ok(Self {
+            gate_proj: candle_nn::linear_b(h, int, cfg.mlp_bias, vb.pp("gate_proj"))?,
+            up_proj: candle_nn::linear_b(h, int, cfg.mlp_bias, vb.pp("up_proj"))?,
+            down_proj: candle_nn::linear_b(int, h, cfg.mlp_bias, vb.pp("down_proj"))?,
+            act: cfg.hidden_act,
+            limit: cfg.swiglu_limit,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self
+            .gate_proj
+            .forward(x)?
+            .clamp(f64::NEG_INFINITY, self.limit)?;
+        let up = self.up_proj.forward(x)?.clamp(-self.limit, self.limit)?;
+        self.down_proj.forward(&(&self.act.forward(&gate)? * &up)?)
+    }
+}
+
+/// 3D experts (`DeepseekV4Experts`): `gate_up_proj [E, 2*int, h]` and
+/// `down_proj [E, h, int]`. Per-expert swiGLU matches `_apply_gate`.
+pub struct DeepseekV4Experts {
+    num_experts: usize,
+    gate_up_proj: Tensor,
+    down_proj: Tensor,
+    act: Activation,
+    limit: f64,
+}
+
+impl DeepseekV4Experts {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let e = cfg.n_routed_experts;
+        let h = cfg.hidden_size;
+        let int = cfg.moe_intermediate_size;
+        Ok(Self {
+            num_experts: e,
+            gate_up_proj: vb.get((e, 2 * int, h), "gate_up_proj")?,
+            down_proj: vb.get((e, h, int), "down_proj")?,
+            act: cfg.hidden_act,
+            limit: cfg.swiglu_limit,
+        })
+    }
+
+    fn apply_gate(&self, gate_up: &Tensor) -> Result<Tensor> {
+        let chunks = gate_up.chunk(2, D::Minus1)?;
+        let gate = chunks[0].clamp(f64::NEG_INFINITY, self.limit)?;
+        let up = chunks[1].clamp(-self.limit, self.limit)?;
+        &self.act.forward(&gate)? * &up
+    }
+
+    /// `topk_ids`/`topk_weight` are `[n, top_k]`; gather per-expert activations
+    /// with `index_add`, mirroring `DeepseekV4Experts.forward`.
+    pub fn forward(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
+        let topk_ids = topk_ids.contiguous()?;
+        let mut y = xs.zeros_like()?;
+        let counts = topk_ids.flatten_all()?.bincount(self.num_experts as u32)?;
+        for (i, &cnt) in counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let idx_top = topk_ids.eq(i as f64)?.nonzero()?.t()?;
+            let idx = &idx_top.i(0)?.contiguous()?;
+            let top = &idx_top.i(1)?.contiguous()?;
+            let x = xs.index_select(idx, 0)?;
+            let gate_up = x.matmul(&self.gate_up_proj.i(i)?.t()?)?;
+            let current = self
+                .apply_gate(&gate_up)?
+                .matmul(&self.down_proj.i(i)?.t()?)?;
+            let w = topk_weight
+                .index_select(idx, 0)?
+                .gather(&top.unsqueeze(1)?, 1)?
+                .squeeze(1)?
+                .unsqueeze(D::Minus1)?
+                .to_dtype(xs.dtype())?;
+            y = y.index_add(idx, &current.broadcast_mul(&w)?, 0)?;
+        }
+        Ok(y)
+    }
+}
+
+/// Top-k router (`DeepseekV4TopKRouter`): `logits = gate.weight`; scores =
+/// sqrtsoftplus(logits); indices = topk(scores + e_score_correction_bias, top_k);
+/// weights = gather(scores, indices); normalized by sum (+1e-20) and scaled by
+/// `routed_scaling_factor`.
+pub struct DeepseekV4TopKRouter {
+    weight: Tensor,
+    e_score_correction_bias: Tensor,
+    top_k: usize,
+    routed_scaling_factor: f64,
+}
+
+impl DeepseekV4TopKRouter {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?;
+        let bias = match vb.get((cfg.n_routed_experts,), "e_score_correction_bias") {
+            Ok(b) => b,
+            Err(_) => Tensor::zeros(cfg.n_routed_experts, DType::F32, vb.device())?,
+        };
+        Ok(Self {
+            weight,
+            e_score_correction_bias: bias,
+            top_k: cfg.num_experts_per_tok,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+        })
+    }
+
+    /// Returns `(logits, weights, indices)` with `weights`/`indices` shaped
+    /// `[n, top_k]`.
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let h = self.weight.dim(1)?;
+        let flat = hidden_states.reshape(((), h))?;
+        let logits = flat.matmul(&self.weight.t()?)?;
+        let scores = sqrt_softplus(&logits)?;
+        let biased = scores.broadcast_add(&self.e_score_correction_bias)?;
+        let indices = biased.topk_unsorted(self.top_k)?.indices;
+        let weights = scores.gather(&indices, D::Minus1)?;
+        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
+        let weights = (weights.broadcast_div(&denom)? * self.routed_scaling_factor)?;
+        Ok((logits, weights, indices))
+    }
+}
+
+/// Hash router (`DeepseekV4HashRouter`): expert selection from the frozen
+/// `tid2eid [vocab, top_k]` lookup (first `num_hash_layers` layers); the learned
+/// `weight` still produces the per-expert scores used for the weights.
+pub struct DeepseekV4HashRouter {
+    weight: Tensor,
+    tid2eid: Tensor,
+    routed_scaling_factor: f64,
+}
+
+impl DeepseekV4HashRouter {
+    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?;
+        let tid2eid = vb.get((cfg.vocab_size, cfg.num_experts_per_tok), "tid2eid")?;
+        Ok(Self {
+            weight,
+            tid2eid,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        input_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let h = self.weight.dim(1)?;
+        let flat = hidden_states.reshape(((), h))?;
+        let logits = flat.matmul(&self.weight.t()?)?;
+        let scores = sqrt_softplus(&logits)?;
+        let ids = input_ids.flatten_all()?.to_dtype(DType::U32)?;
+        let indices = self
+            .tid2eid
+            .index_select(&ids, 0)?
+            .to_dtype(DType::U32)?
+            .contiguous()?;
+        let weights = scores.gather(&indices, D::Minus1)?;
+        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
+        let weights = (weights.broadcast_div(&denom)? * self.routed_scaling_factor)?;
+        Ok((logits, weights, indices))
+    }
+}
+
+enum DeepseekV4Router {
+    TopK(DeepseekV4TopKRouter),
+    Hash(DeepseekV4HashRouter),
+}
+
+impl DeepseekV4Router {
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        input_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::TopK(r) => r.forward(hidden_states),
+            Self::Hash(r) => r.forward(hidden_states, input_ids.unwrap()),
+        }
+    }
+}
+
+/// Sparse MoE block (`DeepseekV4SparseMoeBlock`): a top-k or hash router, 3D
+/// experts, and a shared-experts MLP added to the routed output. The first
+/// `num_hash_layers` layers use the hash router; the rest use top-k.
+pub struct DeepseekV4SparseMoeBlock {
+    gate: DeepseekV4Router,
+    experts: DeepseekV4Experts,
+    shared_experts: DeepseekV4Mlp,
+}
+
+impl DeepseekV4SparseMoeBlock {
+    pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let is_hash = layer_idx < cfg.num_hash_layers;
+        let gate = if is_hash {
+            DeepseekV4Router::Hash(DeepseekV4HashRouter::new(cfg, vb.pp("gate"))?)
+        } else {
+            DeepseekV4Router::TopK(DeepseekV4TopKRouter::new(cfg, vb.pp("gate"))?)
+        };
+        Ok(Self {
+            gate,
+            experts: DeepseekV4Experts::new(cfg, vb.pp("experts"))?,
+            shared_experts: DeepseekV4Mlp::new(cfg, vb.pp("shared_experts"))?,
+        })
+    }
+
+    /// Forward, returning `(output, router_logits)`. The logits are used for the
+    /// optional auxiliary load-balancing loss.
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        input_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (bs, seq_len, h) = hidden_states.dims3()?;
+        let flat = hidden_states.reshape(((), h))?;
+        let (logits, weights, indices) = self.gate.forward(hidden_states, input_ids)?;
+        let routed = self
+            .experts
+            .forward(&flat, &indices, &weights)?
+            .reshape((bs, seq_len, h))?;
+        let shared = self.shared_experts.forward(hidden_states)?;
+        Ok(((routed + shared)?, logits))
+    }
+}
+
+/// Auxiliary load-balancing loss (Switch Transformer), matching
+/// `load_balancing_loss_func` in `modeling_deepseek_v4.py`. `gate_logits` are
+/// the per-layer router logits (`[n, num_experts]`); `attention_mask` is the
+/// flat per-token mask (weights padding tokens to zero).
+pub fn load_balancing_loss(
+    gate_logits: &[Tensor],
+    num_experts: usize,
+    top_k: usize,
+    attention_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    if gate_logits.is_empty() {
+        return Tensor::zeros(1, DType::F32, &Device::Cpu);
+    }
+    let mut tokens_per_expert_sum = vec![0.0f32; num_experts];
+    let mut router_prob_sum = vec![0.0f32; num_experts];
+    let mut total_rows = 0.0f32;
+    let flat_mask: Option<Vec<f32>> = match attention_mask {
+        Some(m) => Some(m.flatten_all()?.to_vec1::<f32>()?),
+        None => None,
+    };
+    for layer_gate in gate_logits {
+        let rw = candle_nn::ops::softmax_last_dim(layer_gate)?.to_dtype(DType::F32)?;
+        let n = rw.dim(0)?;
+        match &flat_mask {
+            None => {
+                let counts = rw
+                    .topk_unsorted(top_k)?
+                    .indices
+                    .flatten_all()?
+                    .bincount(num_experts as u32)?;
+                for (i, c) in counts.iter().enumerate() {
+                    tokens_per_expert_sum[i] += *c as f32;
+                }
+                let col = rw.sum_keepdim(0)?.flatten_all()?;
+                let col = col.to_vec1::<f32>()?;
+                for (i, s) in col.iter().enumerate() {
+                    router_prob_sum[i] += s;
+                }
+                total_rows += n as f32;
+            }
+            Some(mask) => {
+                let sel = rw.topk_unsorted(top_k)?.indices.flatten_all()?;
+                let sel = sel.to_vec1::<u32>()?;
+                for (pos, &e) in sel.iter().enumerate() {
+                    tokens_per_expert_sum[e as usize] += mask[pos / top_k];
+                }
+                let mask_t = Tensor::from_vec(mask.clone(), n, &Device::Cpu)?;
+                let col = rw
+                    .broadcast_mul(&mask_t.unsqueeze(1)?)?
+                    .sum_keepdim(0)?
+                    .flatten_all()?;
+                let col = col.to_vec1::<f32>()?;
+                for (i, s) in col.iter().enumerate() {
+                    router_prob_sum[i] += s;
+                }
+                total_rows += mask.iter().sum::<f32>();
+            }
+        }
+    }
+    let total = total_rows.max(1e-9);
+    let mut overall = 0.0f32;
+    for i in 0..num_experts {
+        overall += (tokens_per_expert_sum[i] / total) * (router_prob_sum[i] / total);
+    }
+    Tensor::new(overall * num_experts as f32, &Device::Cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2477,6 +2785,226 @@ mod tests {
         let out = attn.forward(&x, 0)?;
         let ref_out = reference_hca_attention(&cfg, &emb, &attn_w, &hca_w, &x, 0)?;
         assert_close(&out, &ref_out, 1e-4, "hca-attn");
+        Ok(())
+    }
+
+    /// MoE parity config: hidden=8, moe_intermediate=16, n_routed_experts=8,
+    /// num_experts_per_tok=2, num_hash_layers=1 (layer 0 hash, layer 1 top-k),
+    /// norm_topk_prob, routed_scaling_factor=2.5, scoring sqrtsoftplus.
+    fn moe_parity_config() -> DeepseekV4Config {
+        serde_json::from_str(
+            r#"{
+                "vocab_size": 32, "hidden_size": 8, "moe_intermediate_size": 16,
+                "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 4, "q_lora_rank": 4, "o_lora_rank": 4, "qk_rope_head_dim": 2,
+                "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                "num_nextn_predict_layers": 0, "o_groups": 2, "num_hash_layers": 1,
+                "index_head_dim": 2, "index_n_heads": 1, "index_topk": 4, "hc_mult": 2,
+                "hc_sinkhorn_iters": 5, "hc_eps": 1e-6, "partial_rotary_factor": 0.5,
+                "sliding_window": 3, "max_position_embeddings": 8, "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
+                "attention_bias": false, "attention_dropout": 0.0, "mlp_bias": false,
+                "norm_topk_prob": true, "routed_scaling_factor": 2.5,
+                "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
+                "swiglu_limit": 10.0, "initializer_range": 0.02,
+                "output_router_logits": false, "router_aux_loss_coef": 0.001, "router_jitter_noise": 0.0,
+                "use_cache": true, "bos_token_id": 0, "eos_token_id": 1,
+                "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+                "compress_ratios": [0, 0],
+                "layer_types": ["sliding_attention", "sliding_attention"],
+                "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16,
+                                 "original_max_position_embeddings": 65536, "type": "yarn"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// MoE weights keyed by their state-dict path (`mlp.…`).
+    fn moe_parity_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
+        let e = cfg.n_routed_experts;
+        let h = cfg.hidden_size;
+        let int = cfg.moe_intermediate_size;
+        let mut m = HashMap::new();
+        m.insert("mlp.gate.weight".into(), det_tensor(&[e, h], 1.0));
+        m.insert(
+            "mlp.gate.e_score_correction_bias".into(),
+            det_tensor(&[e], 2.0),
+        );
+        let vocab = cfg.vocab_size;
+        let tk = cfg.num_experts_per_tok;
+        let v: Vec<u32> = (0..vocab * tk).map(|i| (i as u32) % (e as u32)).collect();
+        m.insert(
+            "mlp.gate.tid2eid".into(),
+            Tensor::from_vec(v, &[vocab, tk], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "mlp.experts.gate_up_proj".into(),
+            det_tensor(&[e, 2 * int, h], 3.0),
+        );
+        m.insert(
+            "mlp.experts.down_proj".into(),
+            det_tensor(&[e, h, int], 4.0),
+        );
+        m.insert(
+            "mlp.shared_experts.gate_proj.weight".into(),
+            det_tensor(&[int, h], 5.0),
+        );
+        m.insert(
+            "mlp.shared_experts.up_proj.weight".into(),
+            det_tensor(&[int, h], 6.0),
+        );
+        m.insert(
+            "mlp.shared_experts.down_proj.weight".into(),
+            det_tensor(&[h, int], 7.0),
+        );
+        m
+    }
+
+    /// Independent transcription of the transformers MoE path
+    /// (`DeepseekV4SparseMoeBlock.forward`, `modeling_deepseek_v4.py` L1076-1093),
+    /// driven by the same weight tensors as the candle module.
+    fn ref_moe(
+        cfg: &DeepseekV4Config,
+        w: &HashMap<String, Tensor>,
+        x: &Tensor,
+        input_ids: Option<&Tensor>,
+        layer_idx: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let h = cfg.hidden_size;
+        let e = cfg.n_routed_experts;
+        let top_k = cfg.num_experts_per_tok;
+        let is_hash = layer_idx < cfg.num_hash_layers;
+        let flat = x.reshape(((), h))?;
+        let gate_w = w.get("mlp.gate.weight").unwrap();
+        let logits = lin(&flat, gate_w)?;
+        let scores = sqrt_softplus(&logits)?;
+        let indices = if is_hash {
+            let tid2eid = w.get("mlp.gate.tid2eid").unwrap();
+            let ids = input_ids.unwrap().flatten_all()?;
+            tid2eid.index_select(&ids, 0)?.contiguous()?
+        } else {
+            let bias = w.get("mlp.gate.e_score_correction_bias").unwrap();
+            let biased = scores.broadcast_add(bias)?;
+            biased.topk_unsorted(top_k)?.indices
+        };
+        let mut weights = scores.gather(&indices, D::Minus1)?;
+        let denom = (weights.sum_keepdim(D::Minus1)? + 1e-20)?;
+        weights = (weights.broadcast_div(&denom)? * cfg.routed_scaling_factor)?;
+        // experts
+        let gate_up = w.get("mlp.experts.gate_up_proj").unwrap();
+        let down = w.get("mlp.experts.down_proj").unwrap();
+        let mut routed = flat.zeros_like()?;
+        let counts = indices.flatten_all()?.bincount(e as u32)?;
+        for (i, &cnt) in counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let idx_top = indices.eq(i as f64)?.nonzero()?.t()?;
+            let idx = &idx_top.i(0)?.contiguous()?;
+            let top = &idx_top.i(1)?.contiguous()?;
+            let xs = flat.index_select(idx, 0)?;
+            let gu = xs.matmul(&gate_up.i(i)?.t()?)?;
+            let ch = gu.chunk(2, D::Minus1)?;
+            let g = ch[0].clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
+            let up = ch[1].clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
+            let gated = (&cfg.hidden_act.forward(&g)? * &up)?;
+            let cur = gated.matmul(&down.i(i)?.t()?)?;
+            let wgt = weights
+                .index_select(idx, 0)?
+                .gather(&top.unsqueeze(1)?, 1)?
+                .squeeze(1)?
+                .unsqueeze(D::Minus1)?
+                .to_dtype(flat.dtype())?;
+            routed = routed.index_add(idx, &cur.broadcast_mul(&wgt)?, 0)?;
+        }
+        // shared experts
+        let g_w = w.get("mlp.shared_experts.gate_proj.weight").unwrap();
+        let u_w = w.get("mlp.shared_experts.up_proj.weight").unwrap();
+        let d_w = w.get("mlp.shared_experts.down_proj.weight").unwrap();
+        let gate = lin(x, g_w)?.clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
+        let up = lin(x, u_w)?.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
+        let shared = lin(&(&cfg.hidden_act.forward(&gate)? * &up)?, d_w)?;
+        let out = (&routed.reshape(x.shape())? + &shared)?;
+        Ok((out, logits))
+    }
+
+    #[test]
+    fn moe_parity_with_transformers() -> candle::Result<()> {
+        let cfg = moe_parity_config();
+        let dev = Device::Cpu;
+        let weights = moe_parity_weights(&cfg);
+        // Top-k router layer (index >= num_hash_layers).
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 1, vb.pp("mlp"))?;
+        let x = det_tensor(&[2, 3, cfg.hidden_size], 91.0);
+        let (out, _) = moe.forward(&x, None)?;
+        let (ref_out, _) = ref_moe(&cfg, &weights, &x, None, 1)?;
+        assert_eq!(out.dims(), ref_out.dims(), "moe-topk shape");
+        assert_close(&out, &ref_out, 1e-4, "moe-topk");
+        // Hash router layer (layer_idx < num_hash_layers), with input_ids.
+        let vb2 = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let moe_hash = DeepseekV4SparseMoeBlock::new(&cfg, 0, vb2.pp("mlp"))?;
+        let ids = Tensor::new(&[3u32, 7, 2, 1, 0, 5][..], &dev)?;
+        let x2 = det_tensor(&[2, 3, cfg.hidden_size], 92.0);
+        let (out2, _) = moe_hash.forward(&x2, Some(&ids))?;
+        let (ref_out2, _) = ref_moe(&cfg, &weights, &x2, Some(&ids), 0)?;
+        assert_eq!(out2.dims(), ref_out2.dims(), "moe-hash shape");
+        assert_close(&out2, &ref_out2, 1e-4, "moe-hash");
+        Ok(())
+    }
+
+    /// Independent reference for the auxiliary load-balancing loss (no mask).
+    fn ref_load_balancing(logits: &[Tensor], e: usize, top_k: usize) -> f32 {
+        let mut tps = vec![0.0f32; e];
+        let mut rps = vec![0.0f32; e];
+        let mut total = 0.0f32;
+        for lg in logits {
+            let rw = candle_nn::ops::softmax_last_dim(lg)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap();
+            let (n, ne) = rw.dims2().unwrap();
+            assert_eq!(ne, e);
+            let sel = rw.topk_unsorted(top_k).unwrap().indices;
+            let counts = sel.flatten_all().unwrap().bincount(e as u32).unwrap();
+            for (i, c) in counts.iter().enumerate() {
+                tps[i] += *c as f32;
+            }
+            let col = rw.sum_keepdim(0).unwrap().flatten_all().unwrap();
+            let col = col.to_vec1::<f32>().unwrap();
+            for (i, s) in col.iter().enumerate() {
+                rps[i] += s;
+            }
+            total += n as f32;
+        }
+        let mut overall = 0.0;
+        for i in 0..e {
+            overall += (tps[i] / total) * (rps[i] / total);
+        }
+        overall * e as f32
+    }
+
+    #[test]
+    fn moe_aux_loss_matches_reference() -> candle::Result<()> {
+        let cfg = moe_parity_config();
+        let dev = Device::Cpu;
+        let weights = moe_parity_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 1, vb.pp("mlp"))?;
+        let x = det_tensor(&[2, 3, cfg.hidden_size], 95.0);
+        let (_, logits) = moe.forward(&x, None)?;
+        let l = load_balancing_loss(
+            std::slice::from_ref(&logits),
+            cfg.n_routed_experts,
+            cfg.num_experts_per_tok,
+            None,
+        )?;
+        let expected = ref_load_balancing(&[logits], cfg.n_routed_experts, cfg.num_experts_per_tok);
+        let got: f32 = l.to_scalar()?;
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "aux loss got {got}, expected {expected}"
+        );
         Ok(())
     }
 
