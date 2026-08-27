@@ -9,6 +9,7 @@
 //! per-layer compression rate and RoPE type (main layers use `rope_theta`,
 //! compressor layers use `compress_rope_theta` with Yarn scaling).
 
+use super::deepseek2::{BincountOp, TopKLastDimOp};
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
@@ -1667,26 +1668,37 @@ pub struct DeepseekV4TopKRouter {
     top_k: usize,
     hidden_size: usize,
     weight: Tensor,
+    e_score_correction_bias: Tensor,
     routed_scaling_factor: f64,
 }
 
 impl DeepseekV4TopKRouter {
     pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
+        let bias = match vb.get((cfg.n_routed_experts,), "e_score_correction_bias") {
+            Ok(b) => b,
+            Err(_) => Tensor::zeros(cfg.n_routed_experts, DType::F32, vb.device())?,
+        };
         Ok(Self {
             top_k: cfg.num_experts_per_tok,
             hidden_size: cfg.hidden_size,
             weight: vb.get((cfg.n_routed_experts, cfg.hidden_size), "weight")?,
+            e_score_correction_bias: bias,
             routed_scaling_factor: cfg.routed_scaling_factor,
         })
     }
 
     /// `x` is `[N, hidden]`; returns `(weights [N,K], indices [N,K])`.
+    ///
+    /// Selection uses `scores + e_score_correction_bias` (matching
+    /// `modeling_deepseek_v4.py`), while the weights are gathered from the raw
+    /// (unbiased) scores.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let n: usize = x.dims()[..x.rank() - 1].iter().product();
         let flat = x.reshape((n, self.hidden_size))?;
         let logits = flat.matmul(&self.weight.t()?)?; // [N, E]
         let scores = sqrt_softplus(&logits)?;
-        let indices = topk_last_dim(&scores, self.top_k)?; // [N, K]
+        let biased = scores.broadcast_add(&self.e_score_correction_bias)?;
+        let indices = topk_last_dim(&biased, self.top_k)?; // [N, K]
         let weights = scores.gather(&indices, D::Minus1)?; // [N, K]
         let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
         let weights = weights.broadcast_div(&denom)?;
@@ -1722,8 +1734,12 @@ impl DeepseekV4HashRouter {
         let flat = x.reshape((n, self.hidden_size))?;
         let logits = flat.matmul(&self.weight.t()?)?;
         let scores = sqrt_softplus(&logits)?;
-        let ids = input_ids.flatten_all()?; // [N]
-        let indices = self.tid2eid.index_select(&ids, 0)?; // [N, K]
+        let ids = input_ids.flatten_all()?.to_dtype(DType::I64)?; // [N]
+        let indices = self
+            .tid2eid
+            .index_select(&ids, 0)?
+            .to_dtype(DType::I64)?
+            .contiguous()?; // [N, K]
         let weights = scores.gather(&indices, D::Minus1)?;
         let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
         let weights = weights.broadcast_div(&denom)?;
@@ -1777,6 +1793,73 @@ impl DeepseekV4SparseMoeBlock {
         let shared = self.shared_experts.forward(x)?;
         routed.add(&shared)
     }
+}
+
+/// Auxiliary load-balancing loss (Switch Transformer), matching
+/// `load_balancing_loss_func` in `modeling_deepseek_v4.py`. `gate_logits` are
+/// the per-layer router logits (`[N, num_experts]`); `attention_mask` is the
+/// flat per-token mask (weights padding tokens to zero).
+pub fn load_balancing_loss(
+    gate_logits: &[Tensor],
+    num_experts: usize,
+    top_k: usize,
+    attention_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    if gate_logits.is_empty() {
+        return Tensor::zeros(1, DType::F32, &Device::Cpu);
+    }
+    let mut tokens_per_expert_sum = vec![0.0f32; num_experts];
+    let mut router_prob_sum = vec![0.0f32; num_experts];
+    let mut total_rows = 0.0f32;
+    let flat_mask: Option<Vec<f32>> = match attention_mask {
+        Some(m) => Some(m.flatten_all()?.to_vec1::<f32>()?),
+        None => None,
+    };
+    for layer_gate in gate_logits {
+        let rw = candle_nn::ops::softmax_last_dim(layer_gate)?.to_dtype(DType::F32)?;
+        let n = rw.dim(0)?;
+        match &flat_mask {
+            None => {
+                let counts = rw
+                    .topk_unsorted(top_k)?
+                    .indices
+                    .flatten_all()?
+                    .bincount(num_experts as u32)?;
+                for (i, c) in counts.iter().enumerate() {
+                    tokens_per_expert_sum[i] += *c as f32;
+                }
+                let col = rw.sum_keepdim(0)?.flatten_all()?;
+                let col = col.to_vec1::<f32>()?;
+                for (i, s) in col.iter().enumerate() {
+                    router_prob_sum[i] += s;
+                }
+                total_rows += n as f32;
+            }
+            Some(mask) => {
+                let sel = rw.topk_unsorted(top_k)?.indices.flatten_all()?;
+                let sel = sel.to_vec1::<u32>()?;
+                for (pos, &e) in sel.iter().enumerate() {
+                    tokens_per_expert_sum[e as usize] += mask[pos / top_k];
+                }
+                let mask_t = Tensor::from_vec(mask.clone(), n, &Device::Cpu)?;
+                let col = rw
+                    .broadcast_mul(&mask_t.unsqueeze(1)?)?
+                    .sum_keepdim(0)?
+                    .flatten_all()?;
+                let col = col.to_vec1::<f32>()?;
+                for (i, s) in col.iter().enumerate() {
+                    router_prob_sum[i] += s;
+                }
+                total_rows += mask.iter().sum::<f32>();
+            }
+        }
+    }
+    let total = total_rows.max(1e-9);
+    let mut overall = 0.0f32;
+    for i in 0..num_experts {
+        overall += (tokens_per_expert_sum[i] / total) * (router_prob_sum[i] / total);
+    }
+    Tensor::new(overall * num_experts as f32, &Device::Cpu)
 }
 
 /// One V4 decoder block (paper §2): an mHC hyper-connection around each of the
@@ -3581,6 +3664,229 @@ mod tests {
             cur = Tensor::new(&[rt], &dev)?.unsqueeze(0)?;
         }
         assert_eq!(tokens, ref_tokens, "generated token sequence mismatch");
+        Ok(())
+    }
+
+    /// MoE parity config: hidden=8, moe_intermediate=16, n_routed_experts=8,
+    /// num_experts_per_tok=2, num_hash_layers=1 (layer 0 hash, layer 1 top-k),
+    /// norm_topk_prob, routed_scaling_factor=2.5, scoring sqrtsoftplus.
+    fn moe_parity_config() -> DeepseekV4Config {
+        serde_json::from_str(
+            r#"{
+                "vocab_size": 32, "hidden_size": 8, "moe_intermediate_size": 16,
+                "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 4, "q_lora_rank": 4, "o_lora_rank": 4, "qk_rope_head_dim": 2,
+                "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                "num_nextn_predict_layers": 0, "o_groups": 2, "num_hash_layers": 1,
+                "index_head_dim": 2, "index_n_heads": 1, "index_topk": 4, "hc_mult": 2,
+                "hc_sinkhorn_iters": 5, "hc_eps": 1e-6, "partial_rotary_factor": 0.5,
+                "sliding_window": 3, "max_position_embeddings": 8, "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
+                "attention_bias": false, "attention_dropout": 0.0, "mlp_bias": false,
+                "norm_topk_prob": true, "routed_scaling_factor": 2.5,
+                "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
+                "swiglu_limit": 10.0, "initializer_range": 0.02,
+                "output_router_logits": false, "router_aux_loss_coef": 0.001, "router_jitter_noise": 0.0,
+                "use_cache": true, "bos_token_id": 0, "eos_token_id": 1,
+                "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
+                "compress_ratios": [0, 0],
+                "layer_types": ["sliding_attention", "sliding_attention"],
+                "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16,
+                                 "original_max_position_embeddings": 65536, "type": "yarn"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// MoE weights keyed by their state-dict path (`mlp.…`).
+    fn moe_parity_weights(cfg: &DeepseekV4Config) -> HashMap<String, Tensor> {
+        let e = cfg.n_routed_experts;
+        let h = cfg.hidden_size;
+        let int = cfg.moe_intermediate_size;
+        let mut m = HashMap::new();
+        m.insert("mlp.gate.weight".into(), det_tensor(&[e, h], 1.0));
+        m.insert(
+            "mlp.gate.e_score_correction_bias".into(),
+            det_tensor(&[e], 2.0),
+        );
+        let vocab = cfg.vocab_size;
+        let tk = cfg.num_experts_per_tok;
+        let v: Vec<u32> = (0..vocab * tk).map(|i| (i as u32) % (e as u32)).collect();
+        m.insert(
+            "mlp.gate.tid2eid".into(),
+            Tensor::from_vec(v, &[vocab, tk], &Device::Cpu).unwrap(),
+        );
+        m.insert(
+            "mlp.experts.gate_up_proj".into(),
+            det_tensor(&[e, 2 * int, h], 3.0),
+        );
+        m.insert(
+            "mlp.experts.down_proj".into(),
+            det_tensor(&[e, h, int], 4.0),
+        );
+        m.insert(
+            "mlp.shared_experts.gate_proj.weight".into(),
+            det_tensor(&[int, h], 5.0),
+        );
+        m.insert(
+            "mlp.shared_experts.up_proj.weight".into(),
+            det_tensor(&[int, h], 6.0),
+        );
+        m.insert(
+            "mlp.shared_experts.down_proj.weight".into(),
+            det_tensor(&[h, int], 7.0),
+        );
+        m
+    }
+
+    /// Independent reference for the sparse MoE block covering both router
+    /// types, transcribed from `modeling_deepseek_v4.py` (TopK/Hash router +
+    /// `DeepseekV4Experts` + shared MLP). Includes `e_score_correction_bias`.
+    fn ref_moe_parity(
+        cfg: &DeepseekV4Config,
+        w: &HashMap<String, Tensor>,
+        x: &Tensor,
+        input_ids: Option<&Tensor>,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (bs, seq, d) = x.dims3()?;
+        let h = cfg.hidden_size;
+        let e = cfg.n_routed_experts;
+        let top_k = cfg.num_experts_per_tok;
+        let flat = x.reshape((bs * seq, h))?;
+        let scores = sqrt_softplus(&flat.matmul(&w["mlp.gate.weight"].t()?)?)?;
+        let indices = if layer_idx < cfg.num_hash_layers {
+            let ids = input_ids.unwrap().flatten_all()?.to_dtype(DType::I64)?;
+            w["mlp.gate.tid2eid"]
+                .index_select(&ids, 0)?
+                .to_dtype(DType::I64)?
+                .contiguous()?
+        } else {
+            let biased = scores.broadcast_add(&w["mlp.gate.e_score_correction_bias"])?;
+            topk_last_dim(&biased, top_k)?
+        };
+        let mut weights = scores.gather(&indices, D::Minus1)?;
+        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
+        weights = (weights.broadcast_div(&denom)? * cfg.routed_scaling_factor)?;
+        // routed experts (all tokens, weighted by the per-expert top-k mask)
+        let gu = &w["mlp.experts.gate_up_proj"];
+        let dw = &w["mlp.experts.down_proj"];
+        let n = flat.dim(0)?;
+        let k = indices.dim(1)?;
+        let zero = Tensor::zeros((n, k), DType::F32, x.device())?;
+        let mut out = flat.zeros_like()?;
+        for i in 0..e {
+            let sel = indices.eq(i as u32)?;
+            let wsel = sel.where_cond(&weights, &zero)?;
+            let wsum = wsel.sum(D::Minus1)?;
+            let gui = gu.narrow(0, i, 1)?.squeeze(0)?;
+            let all = flat.matmul(&gui.t()?)?;
+            let c = all.chunk(2, D::Minus1)?;
+            let gate = c[0].clamp(f64::NEG_INFINITY, cfg.swiglu_limit)?;
+            let up = c[1].clamp(-cfg.swiglu_limit, cfg.swiglu_limit)?;
+            let act = (candle_nn::ops::silu(&gate)? * up)?;
+            let dwi = dw.narrow(0, i, 1)?.squeeze(0)?;
+            let down = act.matmul(&dwi.t()?)?;
+            out = out.add(&down.broadcast_mul(&wsum.unsqueeze(D::Minus1)?)?)?;
+        }
+        let shared = ref_mlp(
+            cfg,
+            &w["mlp.shared_experts.gate_proj.weight"],
+            &w["mlp.shared_experts.up_proj.weight"],
+            &w["mlp.shared_experts.down_proj.weight"],
+            x,
+        )?;
+        let routed = out.reshape((bs, seq, d))?;
+        routed.add(&shared)
+    }
+
+    #[test]
+    fn moe_topk_bias_parity() -> candle::Result<()> {
+        let cfg = moe_parity_config();
+        let dev = Device::Cpu;
+        let weights = moe_parity_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 1, vb.pp("mlp"))?;
+        let x = det_tensor(&[2, 3, cfg.hidden_size], 91.0);
+        let out = moe.forward(&x, None)?;
+        let ref_out = ref_moe_parity(&cfg, &weights, &x, None, 1)?;
+        assert_eq!(out.dims(), ref_out.dims(), "moe-topk shape");
+        assert_close(&out, &ref_out, 1e-4, "moe-topk-bias");
+        Ok(())
+    }
+
+    #[test]
+    fn moe_hash_parity() -> candle::Result<()> {
+        let cfg = moe_parity_config();
+        let dev = Device::Cpu;
+        let weights = moe_parity_weights(&cfg);
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let moe = DeepseekV4SparseMoeBlock::new(&cfg, 0, vb.pp("mlp"))?;
+        let ids = Tensor::new(&[3u32, 7, 2, 1, 0, 5][..], &dev)?;
+        let x = det_tensor(&[2, 3, cfg.hidden_size], 92.0);
+        let out = moe.forward(&x, Some(&ids))?;
+        let ref_out = ref_moe_parity(&cfg, &weights, &x, Some(&ids), 0)?;
+        assert_eq!(out.dims(), ref_out.dims(), "moe-hash shape");
+        assert_close(&out, &ref_out, 1e-4, "moe-hash");
+        Ok(())
+    }
+
+    /// Independent reference for the auxiliary load-balancing loss (no mask).
+    fn ref_load_balancing(logits: &[Tensor], e: usize, top_k: usize) -> f32 {
+        let mut tps = vec![0.0f32; e];
+        let mut rps = vec![0.0f32; e];
+        let mut total = 0.0f32;
+        for lg in logits {
+            let rw = candle_nn::ops::softmax_last_dim(lg)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap();
+            let (n, ne) = rw.dims2().unwrap();
+            assert_eq!(ne, e);
+            let counts = rw
+                .topk_unsorted(top_k)
+                .unwrap()
+                .indices
+                .flatten_all()
+                .unwrap()
+                .bincount(e as u32)
+                .unwrap();
+            for (i, c) in counts.iter().enumerate() {
+                tps[i] += *c as f32;
+            }
+            let col = rw.sum_keepdim(0).unwrap().flatten_all().unwrap();
+            let col = col.to_vec1::<f32>().unwrap();
+            for (i, s) in col.iter().enumerate() {
+                rps[i] += s;
+            }
+            total += n as f32;
+        }
+        let mut overall = 0.0;
+        for i in 0..e {
+            overall += (tps[i] / total) * (rps[i] / total);
+        }
+        overall * e as f32
+    }
+
+    #[test]
+    fn moe_aux_loss_matches_reference() -> candle::Result<()> {
+        let cfg = moe_parity_config();
+        let weights = moe_parity_weights(&cfg);
+        let x = det_tensor(&[2, 3, cfg.hidden_size], 95.0);
+        let flat = x.reshape(((), cfg.hidden_size))?;
+        let logits = flat.matmul(&weights["mlp.gate.weight"].t()?)?;
+        let l = load_balancing_loss(
+            std::slice::from_ref(&logits),
+            cfg.n_routed_experts,
+            cfg.num_experts_per_tok,
+            None,
+        )?;
+        let expected = ref_load_balancing(&[logits], cfg.n_routed_experts, cfg.num_experts_per_tok);
+        let got: f32 = l.to_scalar()?;
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "aux loss got {got}, expected {expected}"
+        );
         Ok(())
     }
 
