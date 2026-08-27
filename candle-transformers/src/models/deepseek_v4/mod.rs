@@ -535,10 +535,56 @@ pub struct DeepseekV4Attention {
     sliding_window: usize,
     kv_cache: Option<Tensor>,
     compressor: Option<DeepseekV4Compressor>,
+    use_flash_attn: bool,
     cfg: DeepseekV4Config,
 }
+
+/// Flash DSA kernel wrapper for DeepSeek-V4, gated by the `flash-attn` feature.
+///
+/// Fuses the exact eager op: `QK^T * scale + additive_mask` (sliding-window
+/// local prefix + per-query compressed `block_bias`), a per-head sink logit
+/// appended pre-softmax, max-subtract (sink included), softmax, drop-sink, and
+/// `@V` — all in one CUDA kernel. Layouts: `q` `[B, Sq, H, D]`, `k`/`v`
+/// `[B, Skv, Hk, D]` (MQA `Hk` divides `H`), `block_bias_mask` `[B, 1, Sq, Skv]`
+/// F32 `0`/`-inf`, `sink_logits` `[H]` F32. Returns `[B, Sq, H, D]`.
+#[cfg(feature = "flash-attn")]
+fn flash_attn_blockmask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    block_bias_mask: &Tensor,
+    sink_logits: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    candle_flash_attn::flash_attn_windowed_blockmask(
+        q,
+        k,
+        v,
+        block_bias_mask,
+        sink_logits,
+        softmax_scale,
+    )
+}
+
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn_blockmask(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _block_bias_mask: &Tensor,
+    _sink_logits: &Tensor,
+    _softmax_scale: f32,
+) -> Result<Tensor> {
+    unimplemented!("compile with '--features flash-attn'")
+}
+
 impl DeepseekV4Attention {
-    pub fn new(cfg: &DeepseekV4Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        cfg: &DeepseekV4Config,
+        layer_idx: usize,
+        use_flash_attn: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
         let rope_variant = if cfg.layer_types[layer_idx] == LayerType::SlidingAttention {
@@ -587,10 +633,10 @@ impl DeepseekV4Attention {
             sliding_window: cfg.sliding_window,
             kv_cache: None,
             compressor,
+            use_flash_attn,
             cfg: cfg.clone(),
         })
     }
-
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
         if let Some(c) = &mut self.compressor {
@@ -636,7 +682,12 @@ impl DeepseekV4Attention {
         }
     }
 
-    pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+    pub fn forward(
+        &mut self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
         let num_heads = self.cfg.num_attention_heads;
         let head_dim = self.cfg.head_dim;
@@ -679,9 +730,15 @@ impl DeepseekV4Attention {
 
         // CSA layer: run the compressor, append the long-range compressed KV
         // entries to the sliding window and extend the mask with its block_bias.
+        // An external/padding attention mask (additive `[B, 1, Sq, kv_len]`,
+        // `0` attend / `-inf` pad) is folded into the local sliding columns so
+        // batched padded prompts stay correct for both eager and flash paths.
         let (k, v, mask) = match &mut self.compressor {
             None => {
-                let mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
+                let mut mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
+                if let Some(ext) = attention_mask {
+                    mask = mask.broadcast_add(ext)?;
+                }
                 (k, v, mask)
             }
             Some(comp) => {
@@ -691,6 +748,10 @@ impl DeepseekV4Attention {
                 let sliding = self
                     .sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?
                     .broadcast_as((bs, 1, seq_len, kv_len))?;
+                let sliding = match attention_mask {
+                    Some(ext) => sliding.broadcast_add(ext)?,
+                    None => sliding,
+                };
                 let mask = Tensor::cat(&[sliding, block_bias], 3)?;
                 (k, v, mask)
             }
@@ -698,28 +759,44 @@ impl DeepseekV4Attention {
 
         let kv_len = k.dim(2)?;
 
-        // Single shared KV head is broadcast to every query head for the bmm.
-        let k = k.broadcast_as((bs, num_heads, kv_len, head_dim))?;
-        let v = v.broadcast_as((bs, num_heads, kv_len, head_dim))?;
-        let att = (q.contiguous()?.matmul(&k.t()?.contiguous()?)? * self.softmax_scale)?;
-        let att = att.broadcast_add(&mask)?;
+        // Attention over the combined [sliding | compressed] KV. The flash DSA
+        // kernel fuses mask + per-head sink + max-subtract + softmax + drop-sink
+        // internally; the eager path materializes them explicitly.
+        let attn_out = if self.use_flash_attn {
+            // The kernel needs a batch-materialized additive mask [B, 1, Sq, Skv].
+            let mask = mask.broadcast_as((bs, 1, seq_len, kv_len))?;
+            // Transpose to the kernel layout [B, S, H, D] (MQA: Hkv == 1).
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
+            let v = v.transpose(1, 2)?.contiguous()?;
+            let sink = self.sinks.to_dtype(DType::F32)?;
+            let out = flash_attn_blockmask(&q, &k, &v, &mask, &sink, self.softmax_scale as f32)?;
+            // Kernel returns [B, Sq, H, D]; undo RoPE in [B, H, Sq, D] layout.
+            self.rotary_emb
+                .forward_conjugate(&out.transpose(1, 2)?, variant, seqlen_offset)?
+        } else {
+            // Single shared KV head is broadcast to every query head for the bmm.
+            let k = k.broadcast_as((bs, num_heads, kv_len, head_dim))?;
+            let v = v.broadcast_as((bs, num_heads, kv_len, head_dim))?;
+            let att = (q.contiguous()?.matmul(&k.t()?.contiguous()?)? * self.softmax_scale)?;
+            let att = att.broadcast_add(&mask.to_dtype(q.dtype())?)?;
 
-        // Per-head learnable sink appended pre-softmax, dropped after.
-        let sinks = self
-            .sinks
-            .reshape((1, num_heads, 1, 1))?
-            .broadcast_as((bs, num_heads, seq_len, 1))?;
-        let att = Tensor::cat(&[att, sinks], D::Minus1)?.contiguous()?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let att = att.narrow(D::Minus1, 0, kv_len)?;
+            // Per-head learnable sink appended pre-softmax, dropped after.
+            let sinks = self
+                .sinks
+                .reshape((1, num_heads, 1, 1))?
+                .broadcast_as((bs, num_heads, seq_len, 1))?;
+            let att = Tensor::cat(&[att, sinks], D::Minus1)?.contiguous()?;
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            let att = att.narrow(D::Minus1, 0, kv_len)?;
 
-        let attn_out = att.matmul(&v.contiguous()?)?;
+            let attn_out = att.matmul(&v.contiguous()?)?;
 
-        // K == V, so V carries RoPE on its rope slice; undo it at the query
-        // positions so each KV contribution stays a function of relative distance.
-        let attn_out = self
-            .rotary_emb
-            .forward_conjugate(&attn_out, variant, seqlen_offset)?;
+            // K == V, so V carries RoPE on its rope slice; undo it at the query
+            // positions so each KV contribution stays a function of relative distance.
+            self.rotary_emb
+                .forward_conjugate(&attn_out, variant, seqlen_offset)?
+        };
 
         // Grouped low-rank output: o_a (block-diagonal over o_groups) then o_b.
         let attn_out = attn_out.transpose(1, 2)?.contiguous()?; // (bs, seq_len, num_heads, head_dim)
@@ -2804,6 +2881,7 @@ mod tests {
         cw: &HashMap<String, Tensor>,
         x: &Tensor,
         seqlen_offset: usize,
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = x.dims3()?;
         let h = cfg.num_attention_heads;
@@ -2838,6 +2916,10 @@ mod tests {
         let v = Tensor::cat(&[kv, compressed_kv], 2)?;
         let sliding = ref_mask(seq_len, kv_len, 0, cfg.sliding_window, x.device())?
             .broadcast_as((bs, 1, seq_len, kv_len))?;
+        let sliding = match attention_mask {
+            Some(ext) => sliding.broadcast_add(ext)?,
+            None => sliding,
+        };
         let mask = Tensor::cat(&[sliding, block_bias], 3)?;
 
         let attn = eager_op(&q, &k, &v, &w["sinks"], &mask, (d as f64).powf(-0.5))?;
@@ -2861,13 +2943,77 @@ mod tests {
             merged.insert(format!("compressor.{k}"), v.clone());
         }
         let vb = VarBuilder::from_tensors(merged, DType::F32, &dev);
-        let mut attn = DeepseekV4Attention::new(&cfg, 0, vb)?;
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0);
-        let out = attn.forward(&x, 0)?;
-        let ref_out = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0)?;
+        let out = attn.forward(&x, 0, None)?;
+        let ref_out = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0, None)?;
         assert_close(&out, &ref_out, 1e-4, "csa-attn");
         Ok(())
+    }
+
+    /// External/padding attention mask folded into the combined
+    /// [sliding | block_bias] mask for a batched CSA layer: a `-inf` at a local
+    /// sliding position must suppress that column, while the compressed
+    /// block_bias columns are unaffected. Verified against the eager reference
+    /// that applies the same external mask to the sliding part.
+    #[test]
+    fn csa_external_mask_combined_with_block_bias() -> candle::Result<()> {
+        let cfg = csa_attention_config();
+        let dev = Device::Cpu;
+        let attn_w = parity_weights(&cfg);
+        let csa_w = csa_parity_weights(&cfg);
+        let x = det_tensor(&[1, 5, cfg.hidden_size], 91.0);
+
+        // All-attend external mask is a no-op: identical to no mask.
+        let zeros = Tensor::zeros((1, 1, 5, 5), DType::F32, &dev)?;
+        let out_none = {
+            let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
+            DeepseekV4Attention::new(&cfg, 0, false, vb)?.forward(&x, 0, None)?
+        };
+        let out_zero = {
+            let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
+            DeepseekV4Attention::new(&cfg, 0, false, vb)?.forward(&x, 0, Some(&zeros))?
+        };
+        assert_close(&out_none, &out_zero, 1e-6, "ext-zero-noop");
+
+        // Masking the first in-window sliding position (query 3 -> KV 1) must
+        // change the output and match the reference that folds the same mask in.
+        let mut m = vec![0.0f32; 5 * 5];
+        m[3 * 5 + 1] = f32::NEG_INFINITY;
+        let ext = Tensor::from_vec(m, (1, 1, 5, 5), &dev)?;
+        let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
+        let out_masked = attn.forward(&x, 0, Some(&ext))?;
+        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
+        let ref_masked = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0, Some(&ext))?;
+        assert_close(&out_masked, &ref_masked, 1e-4, "ext-masked");
+        // And masking must actually perturb the output vs the unmasked case.
+        let flat_a = out_none.flatten_all()?.to_vec1::<f32>()?;
+        let flat_b = out_masked.flatten_all()?.to_vec1::<f32>()?;
+        let diff: f32 = flat_a
+            .iter()
+            .zip(flat_b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff > 1e-3,
+            "external mask had no effect on output (max diff {diff})"
+        );
+        Ok(())
+    }
+
+    /// Merge the attention and compressor sub-namespace weight maps into the
+    /// single `compressor.*`-prefixed map `DeepseekV4Attention::new` expects.
+    fn merged_weights(
+        attn_w: &HashMap<String, Tensor>,
+        extra_w: &HashMap<String, Tensor>,
+    ) -> HashMap<String, Tensor> {
+        let mut merged = attn_w.clone();
+        for (k, v) in extra_w {
+            merged.insert(format!("compressor.{k}"), v.clone());
+        }
+        merged
     }
 
     #[test]
@@ -2898,24 +3044,24 @@ mod tests {
         let dev = Device::Cpu;
         let weights = parity_weights(&cfg);
         let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
-        let mut attn = DeepseekV4Attention::new(&cfg, 0, vb)?;
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let mut cache: Option<Tensor> = None;
 
         let x1 = det_tensor(&[1, 5, cfg.hidden_size], 11.0);
-        let o1 = attn.forward(&x1, 0)?;
+        let o1 = attn.forward(&x1, 0, None)?;
         let r1 = reference_forward(&cfg, &emb, &weights, &x1, 0, &mut cache)?;
         assert_close(&o1, &r1, 1e-4, "step1");
 
         // Step 2: a two-token continuation after the cache has been trimmed.
         let x2 = det_tensor(&[1, 2, cfg.hidden_size], 13.0);
-        let o2 = attn.forward(&x2, 5)?;
+        let o2 = attn.forward(&x2, 5, None)?;
         let r2 = reference_forward(&cfg, &emb, &weights, &x2, 5, &mut cache)?;
         assert_close(&o2, &r2, 1e-4, "step2");
 
         // Step 3: single-token generation off the sliding cache.
         let x3 = det_tensor(&[1, 1, cfg.hidden_size], 17.0);
-        let o3 = attn.forward(&x3, 7)?;
+        let o3 = attn.forward(&x3, 7, None)?;
         let r3 = reference_forward(&cfg, &emb, &weights, &x3, 7, &mut cache)?;
         assert_close(&o3, &r3, 1e-4, "step3");
         Ok(())
@@ -3106,10 +3252,10 @@ mod tests {
             merged.insert(format!("compressor.{k}"), v.clone());
         }
         let vb = VarBuilder::from_tensors(merged, DType::F32, &dev);
-        let mut attn = DeepseekV4Attention::new(&cfg, 0, vb)?;
+        let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let x = det_tensor(&[1, 5, cfg.hidden_size], 81.0);
-        let out = attn.forward(&x, 0)?;
+        let out = attn.forward(&x, 0, None)?;
         let ref_out = reference_hca_attention(&cfg, &emb, &attn_w, &hca_w, &x, 0)?;
         assert_close(&out, &ref_out, 1e-4, "hca-attn");
         Ok(())
@@ -3887,6 +4033,54 @@ mod tests {
             (got - expected).abs() < 1e-4,
             "aux loss got {got}, expected {expected}"
         );
+    /// Flash-vs-eager parity for the DSA kernel, covering all three layer types
+    /// (sliding, CSA, HCA). Both paths run the same BF16 weights on CUDA; the
+    /// only difference is `use_flash_attn`, so a match isolates the kernel's
+    /// fused mask/sink/softmax/drop-sink math from the eager transcription.
+    ///
+    /// Requires `--features flash-attn` (pulls in `cuda`) and a CUDA device;
+    /// skipped with a warning when no GPU is present. The dedicated GPU shapes
+    /// (head_dim 128 tiny and V4-Flash 512/64-head) are validated on the 96GB
+    /// machine via `cargo test -p candle-transformers deepseek_v4 --features cuda,flash-attn`
+    /// (story #4270 verify).
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn flash_eager_parity() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping flash-eager parity ({e})");
+                return Ok(());
+            }
+        };
+        for layer in [
+            LayerType::SlidingAttention,
+            LayerType::CompressedSparseAttention,
+            LayerType::HeavilyCompressedAttention,
+        ] {
+            let mut cfg = parity_config();
+            cfg.layer_types = vec![layer];
+            let attn_w = parity_weights(&cfg);
+            let extra_w = match layer {
+                LayerType::CompressedSparseAttention => csa_parity_weights(&cfg),
+                LayerType::HeavilyCompressedAttention => hca_parity_weights(&cfg),
+                _ => HashMap::new(),
+            };
+            let merged: HashMap<String, Tensor> = merged_weights(&attn_w, &extra_w)
+                .into_iter()
+                .map(|(k, v)| (k, v.to_device(&dev).unwrap().to_dtype(DType::BF16).unwrap()))
+                .collect();
+            let vb_eager = VarBuilder::from_tensors(merged.clone(), DType::BF16, &dev);
+            let vb_flash = VarBuilder::from_tensors(merged, DType::BF16, &dev);
+            let mut eager = DeepseekV4Attention::new(&cfg, 0, false, vb_eager)?;
+            let mut flash = DeepseekV4Attention::new(&cfg, 0, true, vb_flash)?;
+            let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0)
+                .to_device(&dev)?
+                .to_dtype(DType::BF16)?;
+            let e = eager.forward(&x, 0, None)?.to_dtype(DType::F32)?;
+            let f = flash.forward(&x, 0, None)?.to_dtype(DType::F32)?;
+            assert_close(&e, &f, 2e-2, &format!("flash-vs-eager {layer:?}"));
+        }
         Ok(())
     }
 
