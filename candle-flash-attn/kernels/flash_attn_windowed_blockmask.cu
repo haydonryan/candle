@@ -20,7 +20,6 @@
 // selected top-k compressed blocks), not the full KV length.
 //
 // Layouts (contiguous):
-// Layouts (contiguous):
 //   q:   [B, Sq, H,  D]   (BF16)
 //   k:   [B, Skv, Hk, D]  (BF16; MQA: Hk divides H, head kh = h / (H/Hk))
 //   v:   [B, Skv, Hk, D]  (BF16; K == V in DeepSeek V4, treated independently here)
