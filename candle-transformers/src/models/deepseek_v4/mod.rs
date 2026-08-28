@@ -2308,9 +2308,13 @@ impl DeepseekV4TopKRouter {
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let n: usize = x.dims()[..x.rank() - 1].iter().product();
         let flat = x.reshape((n, self.hidden_size))?;
+        // The optional bias is F32 zeros when the checkpoint omits it; bring it
+        // to the score dtype (BF16 for the real model) before adding.
         let logits = flat.matmul(&self.weight.t()?)?; // [N, E]
         let scores = sqrt_softplus(&logits)?;
-        let biased = scores.broadcast_add(&self.e_score_correction_bias)?;
+        // The optional bias is F32 zeros when the checkpoint omits it; bring it
+        // to the score dtype (BF16 for the real model) before adding.
+        let biased = scores.broadcast_add(&self.e_score_correction_bias.to_dtype(scores.dtype())?)?;
         let indices = topk_last_dim(&biased, self.top_k)?; // [N, K]
         let weights = scores.gather(&indices, D::Minus1)?; // [N, K]
         let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;

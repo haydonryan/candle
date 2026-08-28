@@ -6,7 +6,9 @@ extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, IndexOp, Tensor};
-use candle_transformers::models::deepseek_v4::quantized::load_quantized_for_causal_lm;
+use candle_transformers::models::deepseek_v4::quantized::{
+    load_quantized_for_causal_lm, DeepseekV4Quantized,
+};
 use candle_transformers::models::deepseek_v4::DeepseekV4Config;
 use clap::Parser;
 use std::path::PathBuf;
@@ -34,6 +36,22 @@ struct Args {
     /// fp8/fp4 dequant block.
     #[arg(long, default_value_t = 128)]
     block: usize,
+
+    /// Stream one decoder layer at a time (per-layer GPU weight loading) so the
+    /// ~146 GiB real checkpoint runs within ~96 GB VRAM instead of materializing
+    /// all 43 layers eagerly. Only meaningful for the real-schema checkpoint.
+    #[arg(long)]
+    streaming: bool,
+
+    /// Run the forward a second time and report whether logits are bit-identical
+    /// (determinism check).
+    #[arg(long)]
+    determinism_check: bool,
+
+    /// Also run the eager (non-streaming) path on CPU and report the max abs diff
+    /// vs the streaming path (streaming-vs-eager cross-check on a fitting model).
+    #[arg(long)]
+    cross_check: bool,
 }
 
 fn main() -> Result<()> {
@@ -88,27 +106,7 @@ fn main() -> Result<()> {
     // candle does not model. `load_quantized_for_causal_lm(.., real_schema = true)`
     // performs the name remap + FP4 expert assembly.
     let scale_suffix = ".scale";
-    let fp4_prefixes: Vec<String> = vec![
-        "ffn.experts.".into(),
-    ];
-
-    let t0 = std::time::Instant::now();
-    let mut model = unsafe {
-        load_quantized_for_causal_lm(
-            &config,
-            args.use_flash_attn,
-            &shards,
-            &device,
-            DType::BF16,
-            block,
-            scale_suffix,
-            &fp4_prefixes,
-            args.offload_budget_bytes,
-            true,
-        )?
-    };
-    let load_time = t0.elapsed();
-    println!("LOAD OK in {:?}", load_time);
+    let fp4_prefixes: Vec<String> = vec!["ffn.experts.".into()];
 
     let tokens = tokenizer
         .encode(&*args.prompt, true)
@@ -122,9 +120,95 @@ fn main() -> Result<()> {
     );
     let prompt = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
 
-    let t1 = std::time::Instant::now();
-    let logits = model.forward(&prompt, 0)?;
-    let fwd_time = t1.elapsed();
+    let (logits, load_time, fwd_time) = if args.streaming {
+        // Per-layer streaming forward: only the active layer's weights live on
+        // the GPU at a time, so the ~146 GiB checkpoint fits in 96 GB VRAM.
+        let t0 = std::time::Instant::now();
+        let loader = unsafe {
+            DeepseekV4Quantized::new_real(
+                &shards,
+                device.clone(),
+                DType::BF16,
+                args.offload_budget_bytes,
+            )?
+        };
+        let load_time = t0.elapsed(); // open mmaps; weights are loaded lazily per layer
+        let t1 = std::time::Instant::now();
+        let logits = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
+        let fwd_time = t1.elapsed();
+        println!(
+            "STREAMING: resident_bytes={} cached_len={} evictions={}",
+            loader.resident_bytes(),
+            loader.cached_len(),
+            loader.evictions()
+        );
+        (logits, load_time, fwd_time)
+    } else {
+        let t0 = std::time::Instant::now();
+        let mut model = unsafe {
+            load_quantized_for_causal_lm(
+                &config,
+                args.use_flash_attn,
+                &shards,
+                &device,
+                DType::BF16,
+                block,
+                scale_suffix,
+                &fp4_prefixes,
+                args.offload_budget_bytes,
+                true,
+            )?
+        };
+        let load_time = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let logits = model.forward(&prompt, 0)?;
+        let fwd_time = t1.elapsed();
+        (logits, load_time, fwd_time)
+    };
+    println!("LOAD OK in {:?}", load_time);
+    println!("FORWARD OK in {:?}", fwd_time);
+
+    // Determinism: run the streaming forward again and compare bit-for-bit.
+    if args.determinism_check {
+        let loader = unsafe {
+            DeepseekV4Quantized::new_real(
+                &shards,
+                device.clone(),
+                DType::BF16,
+                args.offload_budget_bytes,
+            )?
+        };
+        let t = std::time::Instant::now();
+        let logits2 = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
+        println!("DETERMINISM second forward in {:?}", t.elapsed());
+        let a = logits.flatten_all()?.to_vec1::<f32>()?;
+        let b = logits2.flatten_all()?.to_vec1::<f32>()?;
+        let same =
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+        println!("DETERMINISM: bit-identical = {same}");
+    }
+
+    // Cross-check: streaming vs eager on CPU (only valid when the model fits).
+    if args.cross_check {
+        let loader = unsafe {
+            DeepseekV4Quantized::new_real(
+                &shards,
+                candle::Device::Cpu,
+                DType::F32,
+                args.offload_budget_bytes,
+            )?
+        };
+        let mut eager = loader.load_model(&config, args.use_flash_attn)?;
+        let eager_logits = eager.forward(&prompt, 0)?;
+        let s = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
+        let a = eager_logits.flatten_all()?.to_vec1::<f32>()?;
+        let b = s.flatten_all()?.to_vec1::<f32>()?;
+        let mut max_abs = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+        println!("CROSS-CHECK streaming vs eager: max_abs_diff = {max_abs:.6}");
+    }
 
     let flat = logits.flatten_all()?;
     let f = flat.to_vec1::<f32>()?;
