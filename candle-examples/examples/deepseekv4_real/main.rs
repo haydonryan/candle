@@ -83,16 +83,13 @@ fn main() -> Result<()> {
     );
 
     let block = (args.block, args.block);
-    // Real deepseek-ai V4-Flash: scale tensors are `<weight>.scale` (not `_scale_inv`),
-    // and routed/shared expert tensors are fp4 E2M1 named w1/w2/w3.
+    // Real deepseek-ai V4-Flash: flat-name schema (embed.weight / attn.* / ffn.* /
+    // hc_*) with `.scale` fp8 scales, per-expert FP4 w1/w2/w3, and MTP layers that
+    // candle does not model. `load_quantized_for_causal_lm(.., real_schema = true)`
+    // performs the name remap + FP4 expert assembly.
     let scale_suffix = ".scale";
     let fp4_prefixes: Vec<String> = vec![
-        "experts.w1".into(),
-        "experts.w3".into(),
-        "experts.w2".into(),
-        "shared_experts.w1".into(),
-        "shared_experts.w3".into(),
-        "shared_experts.w2".into(),
+        "ffn.experts.".into(),
     ];
 
     let t0 = std::time::Instant::now();
@@ -107,6 +104,7 @@ fn main() -> Result<()> {
             scale_suffix,
             &fp4_prefixes,
             args.offload_budget_bytes,
+            true,
         )?
     };
     let load_time = t0.elapsed();
