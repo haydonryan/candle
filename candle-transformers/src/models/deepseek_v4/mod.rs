@@ -4062,7 +4062,7 @@ mod tests {
             // builds a varlen batch with each sequence at its own slot.
             for i in 1..n_seq {
                 for p in 0..prefills[i] {
-                    let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + i * 100 + p) as f32)
+                    let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + p) as f32)
                         .to_device(dev)?
                         .to_dtype(DType::BF16)?;
                     let xp = x.clone();
@@ -4083,7 +4083,7 @@ mod tests {
                 cache.comp_state[i] = std::mem::replace(&mut cache.comp_state[0], fresh);
             }
             for p in 0..prefills[0] {
-                let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + 0 * 100 + p) as f32)
+                let x = det_tensor(&[1, 1, cfg.hidden_size], (700 + p) as f32)
                     .to_device(dev)?
                     .to_dtype(DType::BF16)?;
                 let xp = x.clone();
