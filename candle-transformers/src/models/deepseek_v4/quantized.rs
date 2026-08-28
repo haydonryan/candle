@@ -56,10 +56,12 @@ pub fn e8m0_to_f32(b: u8) -> f32 {
     2f32.powi(b as i32 - 127)
 }
 
-/// FP4 E2M1 nibble -> f32: sign(1) exp(2) mantissa(1), exponent bias 1.
-///
-/// `(-1)^s * 2^(e-1) * (1 + m/2)` for `e` in `1..=2`, `(-1)^s * m/2` for the
-/// subnormal `e == 0`, and `inf`/`NaN` for `e == 3`.
+/// `(-1)^s * 2^(e-1) * (1 + m/2)` for `e` in `1..=3`, `(-1)^s * m/2` for the
+/// subnormal `e == 0`. Unlike FP8 E4M3, E2M1 has **no** inf/NaN pattern: the
+/// max exponent `e == 3` is finite, yielding `4.0` (`m == 0`) and `6.0`
+/// (`m == 1`). This matches the canonical FP4 E2M1 value table
+/// `(0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6)` used by
+/// the transformers `finegrained_fp8` reference.
 #[inline]
 pub fn fp4_e2m1_to_f32(nib: u8) -> f32 {
     let sign = if nib & 0x8 != 0 { -1.0 } else { 1.0 };
@@ -67,13 +69,6 @@ pub fn fp4_e2m1_to_f32(nib: u8) -> f32 {
     let man = (nib & 0x1) as f32;
     let abs = match exp {
         0 => man * 0.5,
-        3 => {
-            if man == 0.0 {
-                f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
         e => (1.0 + man / 2.0) * 2f32.powi(e as i32 - 1),
     };
     sign * abs
@@ -548,6 +543,14 @@ pub struct DeepseekV4Quantized {
     fp4_prefixes: Vec<String>,
     real_schema: bool,
     dev: Device,
+    /// Where dequantized weights are materialized and cached (the offload
+    /// cache). Always CPU: keeping weights off the GPU lets the real ~146 GiB
+    /// checkpoint run on a 96 GB card, because candle's stream-ordered CUDA
+    /// allocator pools deallocated blocks and would otherwise retain every
+    /// layer's dequantized memory, growing VRAM monotonically toward the full
+    /// ~500 GiB bf16 model. Per-layer weights are copied to `dev` (the compute
+    /// device) only while that layer is active and dropped afterwards.
+    cache_dev: Device,
     out_dtype: DType,
     cache: Mutex<WeightCache>,
 }
@@ -587,6 +590,7 @@ impl DeepseekV4Quantized {
             fp4_prefixes: fp4_prefixes.to_vec(),
             real_schema,
             dev,
+            cache_dev: Device::Cpu,
             out_dtype,
             cache: Mutex::new(WeightCache::new(max_bytes)),
         })
@@ -718,7 +722,7 @@ impl DeepseekV4Quantized {
         let rank = dims.len();
         if rank < 2 {
             // 1-D plain weights (norms, sinks, hc base/scale, ...).
-            let t = self.st.load(name, &self.dev)?;
+            let t = self.st.load(name, &self.cache_dev)?;
             return self.finalize_dtype(t, dims);
         }
         let rows: usize = dims[..rank - 1].iter().product();
@@ -731,12 +735,12 @@ impl DeepseekV4Quantized {
         };
         let block = if is_fp4 { self.fp4_block } else { self.block };
         let t = if is_fp4 {
-            dequantize_fp4_linear(&self.st, name, &scale, rows, cols, block, &self.dev)?
+            dequantize_fp4_linear(&self.st, name, &scale, rows, cols, block, &self.cache_dev)?
         } else if self.names.contains(&scale) {
-            dequantize_fp8_linear(&self.st, name, &scale, rows, cols, block, &self.dev)?
+            dequantize_fp8_linear(&self.st, name, &scale, rows, cols, block, &self.cache_dev)?
         } else {
             // Plain multi-dim weight (e.g. bf16/fp32 projection or norm).
-            self.st.load(name, &self.dev)?
+            self.st.load(name, &self.cache_dev)?
         };
         self.finalize_dtype(t, dims)
     }
@@ -810,6 +814,7 @@ impl DeepseekV4Quantized {
             .contiguous()?; // [B,S,hc_mult,D]
 
         for i in 0..cfg.num_hidden_layers {
+            let t_layer = std::time::Instant::now();
             let layer_vb = VarBuilder::new_with_args(
                 Box::new(LayerBackend {
                     loader: self,
@@ -819,7 +824,18 @@ impl DeepseekV4Quantized {
                 dev,
             );
             let mut layer = DeepseekV4DecoderLayer::new(cfg, i, use_flash_attn, layer_vb)?;
+            let t_load = std::time::Instant::now();
             hidden = layer.forward(&hidden, Some(input_ids), seqlen_offset)?;
+            let t_fwd = std::time::Instant::now();
+            eprintln!(
+                "  layer {i}/{} load={:?} fwd={:?} resident={} cached={} evict={}",
+                cfg.num_hidden_layers - 1,
+                t_load.duration_since(t_layer),
+                t_fwd.duration_since(t_load),
+                self.resident_bytes(),
+                self.cached_len(),
+                self.evictions()
+            );
             // Drop this layer's GPU tensors before loading the next layer; the
             // CPU dequantized weights stay in the size-bounded LRU cache (up to
             // `max_bytes`, which callers size generously) so revisited/re-loaded
@@ -1030,16 +1046,19 @@ mod tests {
 
     #[test]
     fn fp4_e2m1_values() {
-        assert_eq!(fp4_e2m1_to_f32(0x0), 0.0);
-        assert_eq!(fp4_e2m1_to_f32(0x1), 0.5); // subnormal
-        assert_eq!(fp4_e2m1_to_f32(0x2), 1.0);
-        assert_eq!(fp4_e2m1_to_f32(0x3), 1.5);
-        assert_eq!(fp4_e2m1_to_f32(0x4), 2.0);
-        assert_eq!(fp4_e2m1_to_f32(0x5), 3.0);
-        assert!(fp4_e2m1_to_f32(0x6).is_infinite());
-        assert!(fp4_e2m1_to_f32(0x7).is_nan());
-        assert_eq!(fp4_e2m1_to_f32(0xA), -1.0);
-        assert!(fp4_e2m1_to_f32(0xE).is_infinite());
+        // Canonical FP4 E2M1 value table (matches the transformers
+        // `finegrained_fp8._FP4_E2M1_LUT` reference):
+        //   (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6).
+        // E2M1 has no inf/NaN pattern: the max exponent e=3 is finite (4/6).
+        let lut = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, //
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        for (nib, &want) in lut.iter().enumerate() {
+            let got = fp4_e2m1_to_f32(nib as u8);
+            assert_eq!(got, want, "fp4 nibble 0x{nib:X}");
+            assert!(got.is_finite(), "fp4 nibble 0x{nib:X} must be finite");
+        }
     }
 
     #[test]
@@ -1084,22 +1103,10 @@ mod tests {
         let scale = [127, 128, 126, 134]; // 1.0, 2.0, 0.5, 128.0
         let out = dequantize_fp4_block_scale(&packed, &scale, 4, 4, (2, 2)).unwrap();
         let expected = [
-            1.0,
-            1.5,
-            4.0,
-            6.0, //
-            -1.0,
-            -1.5,
-            f32::INFINITY,
-            f32::NAN, //
-            0.25,
-            0.5,
-            192.0,
-            256.0, //
-            1.5,
-            f32::INFINITY,
-            0.0,
-            0.0,
+            1.0, 1.5, 4.0, 6.0, //
+            -1.0, -1.5, 8.0, 12.0, //
+            0.25, 0.5, 192.0, 256.0, //
+            1.5, 2.0, 0.0, 0.0,
         ];
         assert_eq!(out.len(), 16);
         for (i, (a, b)) in out.iter().zip(expected).enumerate() {
