@@ -440,15 +440,8 @@ pub fn fold_fp8_block_scale(
             let man = b & 0x07;
             // fp8 e4m3: value = (-1)^s * 2^(exp-7) * (1 + man/8) (or subnormal).
             // Multiply by 2^shift => exp += shift.
-            let mut nexp = exp + shift;
-            // clamp
-            if nexp > 14 {
-                nexp = 14;
-            }
-            if nexp < 0 {
-                nexp = 0;
-            }
-            let nb = (sign as u8) | ((nexp as u8) << 3) | man;
+            let nexp = exp + shift;
+            let nb = sign | ((nexp.clamp(0, 14) as u8) << 3) | man;
             out.push(nb);
         }
     }
@@ -588,6 +581,7 @@ mod tests {
         max_abs_diff(a, b) / denom
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fp8_block_gemm_ref(
         act: &[f32],
         m: usize,

@@ -874,11 +874,11 @@ impl DeepseekV4Attention {
         let fp8 = if cfg.fp8_compute {
             let compute = Fp8Compute::new(vb.device())?;
             Some(AttentionFp8 {
-                q_a: fp8_gemm::Fp8Weight::from_tensor(&q_a_proj.weight())?,
-                q_b: fp8_gemm::Fp8Weight::from_tensor(&q_b_proj.weight())?,
-                kv: fp8_gemm::Fp8Weight::from_tensor(&kv_proj.weight())?,
+                q_a: fp8_gemm::Fp8Weight::from_tensor(q_a_proj.weight())?,
+                q_b: fp8_gemm::Fp8Weight::from_tensor(q_b_proj.weight())?,
+                kv: fp8_gemm::Fp8Weight::from_tensor(kv_proj.weight())?,
                 o_a: fp8_gemm::Fp8Weight::from_tensor(&o_a_proj.weight)?,
-                o_b: fp8_gemm::Fp8Weight::from_tensor(&o_b_proj.weight())?,
+                o_b: fp8_gemm::Fp8Weight::from_tensor(o_b_proj.weight())?,
                 compute,
             })
         } else {
