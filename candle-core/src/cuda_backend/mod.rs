@@ -1575,7 +1575,12 @@ impl BackendStorage for CudaStorage {
         };
         let inp = &inp;
 
-        let kernel_name = format!("cast_{}_{}", self.dtype().as_str(), dtype.as_str());
+        // The cast kernels are named with the fp8 dtype as `f8_e4m3` (matching
+        // the `float8` CUDA type), while `DType::as_str()` returns `f8e4m3`.
+        // Normalize so the requested kernel symbol matches the compiled PTX,
+        // otherwise CUDA fp8 `to_dtype` fails with "named symbol not found".
+        let kernel_name = format!("cast_{}_{}", self.dtype().as_str(), dtype.as_str())
+            .replace("f8e4m3", "f8_e4m3");
         let func = dev.get_or_load_func(&kernel_name, &kernels::CAST)?;
         let slice = match dtype {
             DType::U8 => {
