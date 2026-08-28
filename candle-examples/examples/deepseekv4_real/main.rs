@@ -33,6 +33,12 @@ struct Args {
     #[arg(long, default_value_t = 80_000_000_000)]
     offload_budget_bytes: usize,
 
+    /// Resident GPU weight cache budget in bytes — how many layers' dequantized
+    /// weights are kept on the GPU (LRU) instead of being dropped after each
+    /// layer. Size toward the available VRAM (e.g. 85 GiB on a 96 GB card).
+    #[arg(long, default_value_t = 80_000_000_000)]
+    gpu_budget_bytes: usize,
+
     /// fp8/fp4 dequant block.
     #[arg(long, default_value_t = 128)]
     block: usize,
@@ -130,6 +136,7 @@ fn main() -> Result<()> {
                 device.clone(),
                 DType::BF16,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let load_time = t0.elapsed(); // open mmaps; weights are loaded lazily per layer
@@ -137,10 +144,13 @@ fn main() -> Result<()> {
         let logits = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
         let fwd_time = t1.elapsed();
         println!(
-            "STREAMING: resident_bytes={} cached_len={} evictions={}",
+            "STREAMING: resident_bytes={} cached_len={} evictions={} gpu_bytes={} gpu_cached={} gpu_evict={}",
             loader.resident_bytes(),
             loader.cached_len(),
-            loader.evictions()
+            loader.evictions(),
+            loader.gpu_resident_bytes(),
+            loader.gpu_cached_len(),
+            loader.gpu_evictions()
         );
         (logits, load_time, fwd_time)
     } else {
@@ -156,6 +166,7 @@ fn main() -> Result<()> {
                 scale_suffix,
                 &fp4_prefixes,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
                 true,
             )?
         };
@@ -176,6 +187,7 @@ fn main() -> Result<()> {
                 device.clone(),
                 DType::BF16,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let t = std::time::Instant::now();
@@ -198,6 +210,7 @@ fn main() -> Result<()> {
                 candle::Device::Cpu,
                 DType::F32,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let mut eager = loader.load_model(&config, args.use_flash_attn)?;

@@ -553,6 +553,11 @@ pub struct DeepseekV4Quantized {
     cache_dev: Device,
     out_dtype: DType,
     cache: Mutex<WeightCache>,
+    /// GPU-resident weight cache (size-bounded LRU on `dev`). Keeps recently
+    /// used layers' weights on the GPU (up to `gpu_max_bytes`, sized toward the
+    /// available VRAM) so they are not re-transferred/re-dequantized on reuse,
+    /// instead of dropping every layer's GPU tensors after each forward step.
+    gpu_cache: Mutex<WeightCache>,
 }
 
 impl DeepseekV4Quantized {
@@ -578,6 +583,7 @@ impl DeepseekV4Quantized {
         dev: Device,
         out_dtype: DType,
         max_bytes: usize,
+        gpu_max_bytes: usize,
     ) -> Result<Self> {
         let st = MmapedSafetensors::multi(paths)?;
         let names = st.tensors().into_iter().map(|(n, _)| n).collect();
@@ -593,6 +599,7 @@ impl DeepseekV4Quantized {
             cache_dev: Device::Cpu,
             out_dtype,
             cache: Mutex::new(WeightCache::new(max_bytes)),
+            gpu_cache: Mutex::new(WeightCache::new(gpu_max_bytes)),
         })
     }
 
@@ -608,6 +615,7 @@ impl DeepseekV4Quantized {
         dev: Device,
         out_dtype: DType,
         max_bytes: usize,
+        gpu_max_bytes: usize,
     ) -> Result<Self> {
         Self::new(
             paths,
@@ -619,6 +627,7 @@ impl DeepseekV4Quantized {
             dev,
             out_dtype,
             max_bytes,
+            gpu_max_bytes,
         )
     }
 
@@ -750,13 +759,44 @@ impl DeepseekV4Quantized {
         self.cache.lock().resident_bytes()
     }
 
+    /// Number of offload-cache evictions since construction (LRU budget drops).
+    pub fn evictions(&self) -> usize {
+        self.cache.lock().evictions()
+    }
+
     pub fn cached_len(&self) -> usize {
         self.cache.lock().len()
     }
 
-    /// Number of offload-cache evictions since construction (LRU budget drops).
-    pub fn evictions(&self) -> usize {
-        self.cache.lock().evictions()
+    /// Resolve a weight onto the compute device (`dev`), keeping it resident in
+    /// the GPU-bounded LRU so recently used layers stay on the GPU instead of
+    /// being re-transferred/re-dequantized on reuse. Falls back to the CPU
+    /// offload cache (dequantize on demand) for a cold miss.
+    fn gpu_weight(&self, name: &str, dims: &[usize], dev: &Device, dtype: DType) -> Result<Tensor> {
+        if let Some(t) = self.gpu_cache.lock().get(name) {
+            return t.to_dtype(dtype);
+        }
+        let t = self
+            .load_weight(name, dims)?
+            .to_device(dev)?
+            .to_dtype(dtype)?;
+        self.gpu_cache.lock().insert(name, t.clone());
+        Ok(t)
+    }
+
+    /// Resident bytes held on the compute device (GPU) by the layer cache.
+    pub fn gpu_resident_bytes(&self) -> usize {
+        self.gpu_cache.lock().resident_bytes()
+    }
+
+    /// Number of distinct GPU-resident tensors currently cached.
+    pub fn gpu_cached_len(&self) -> usize {
+        self.gpu_cache.lock().len()
+    }
+
+    /// Number of GPU-cache evictions since construction (LRU budget drops).
+    pub fn gpu_evictions(&self) -> usize {
+        self.gpu_cache.lock().evictions()
     }
 
     /// Build the eager [`DeepseekV4ForCausalLM`] from this loader's on-demand
@@ -828,18 +868,22 @@ impl DeepseekV4Quantized {
             hidden = layer.forward(&hidden, Some(input_ids), seqlen_offset)?;
             let t_fwd = std::time::Instant::now();
             eprintln!(
-                "  layer {i}/{} load={:?} fwd={:?} resident={} cached={} evict={}",
+                "  layer {i}/{} load={:?} fwd={:?} resident={} cached={} evict={} gpu={} gpu_cached={} gpu_evict={}",
                 cfg.num_hidden_layers - 1,
                 t_load.duration_since(t_layer),
                 t_fwd.duration_since(t_load),
                 self.resident_bytes(),
                 self.cached_len(),
-                self.evictions()
+                self.evictions(),
+                self.gpu_resident_bytes(),
+                self.gpu_cached_len(),
+                self.gpu_evictions()
             );
-            // Drop this layer's GPU tensors before loading the next layer; the
-            // CPU dequantized weights stay in the size-bounded LRU cache (up to
-            // `max_bytes`, which callers size generously) so revisited/re-loaded
-            // tensors do not need to be re-dequantized or re-read from mmap.
+            // Layer GPU weights are kept in the size-bounded GPU LRU
+            // (`gpu_cache`, up to `gpu_max_bytes`) so recently used layers stay
+            // resident on the GPU instead of being re-transferred on reuse;
+            // tensors beyond the budget are evicted (LRU), freeing VRAM. The
+            // CPU dequantized weights stay in the size-bounded offload cache.
             drop(layer);
         }
 
@@ -863,7 +907,7 @@ struct QuantizedBackend<'a> {
 impl SimpleBackend for QuantizedBackend<'_> {
     fn get(&self, s: Shape, name: &str, _h: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let dims = s.dims().to_vec();
-        let t = self.loader.load_weight(name, &dims)?;
+        let t = self.loader.gpu_weight(name, &dims, dev, dtype)?;
         if t.shape() != &s {
             return Err(Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -872,7 +916,7 @@ impl SimpleBackend for QuantizedBackend<'_> {
             }
             .bt());
         }
-        t.to_device(dev)?.to_dtype(dtype)
+        Ok(t)
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
@@ -886,10 +930,7 @@ impl SimpleBackend for QuantizedBackend<'_> {
         } else {
             self.loader.st.get(name)?.shape().to_vec()
         };
-        self.loader
-            .load_weight(name, &dims)?
-            .to_device(dev)?
-            .to_dtype(dtype)
+        self.loader.gpu_weight(name, &dims, dev, dtype)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -916,7 +957,7 @@ impl SimpleBackend for LayerBackend<'_> {
     fn get(&self, s: Shape, name: &str, _h: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
         let full = self.full_name(name);
         let dims = s.dims().to_vec();
-        let t = self.loader.load_weight(&full, &dims)?;
+        let t = self.loader.gpu_weight(&full, &dims, dev, dtype)?;
         if t.shape() != &s {
             return Err(Error::UnexpectedShape {
                 msg: format!("shape mismatch for {full}"),
@@ -925,7 +966,7 @@ impl SimpleBackend for LayerBackend<'_> {
             }
             .bt());
         }
-        t.to_device(dev)?.to_dtype(dtype)
+        Ok(t)
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
@@ -938,10 +979,7 @@ impl SimpleBackend for LayerBackend<'_> {
         } else {
             self.loader.st.get(&full)?.shape().to_vec()
         };
-        self.loader
-            .load_weight(&full, &dims)?
-            .to_device(dev)?
-            .to_dtype(dtype)
+        self.loader.gpu_weight(&full, &dims, dev, dtype)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -973,6 +1011,7 @@ pub unsafe fn load_quantized_for_causal_lm(
     scale_suffix: &str,
     fp4_prefixes: &[String],
     offload_budget_bytes: usize,
+    gpu_max_bytes: usize,
     real_schema: bool,
 ) -> Result<DeepseekV4ForCausalLM> {
     let fp4_block = if real_schema { (1, 32) } else { block };
@@ -986,6 +1025,7 @@ pub unsafe fn load_quantized_for_causal_lm(
         dev.clone(),
         out_dtype,
         offload_budget_bytes,
+        gpu_max_bytes,
     )?;
     loader.load_model(cfg, use_flash_attn)
 }
@@ -1621,6 +1661,7 @@ mod tests {
                 dev.clone(),
                 DType::F32,
                 budget,
+                budget,
             )?
         };
         // Every weight requested by the model must be present or intentionally
@@ -1656,6 +1697,7 @@ mod tests {
                     block,
                     scale_suffix,
                     &fp4_prefixes,
+                    budget,
                     budget,
                     false,
                 )?
@@ -2050,6 +2092,7 @@ mod tests {
                 scale_suffix,
                 &fp4_prefixes,
                 budget,
+                budget,
                 true,
             )?
         };
@@ -2072,6 +2115,7 @@ mod tests {
                 block,
                 scale_suffix,
                 &fp4_prefixes,
+                budget,
                 budget,
                 true,
             )?
@@ -2097,8 +2141,9 @@ mod tests {
 
         let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?;
 
-        let loader =
-            unsafe { DeepseekV4Quantized::new_real(&paths, dev.clone(), DType::F32, budget)? };
+        let loader = unsafe {
+            DeepseekV4Quantized::new_real(&paths, dev.clone(), DType::F32, budget, budget)?
+        };
         // Streaming path: only one layer's weights resident at a time.
         let logits_stream = loader.forward_real(&cfg, false, &ids, 0)?;
         assert_eq!(
