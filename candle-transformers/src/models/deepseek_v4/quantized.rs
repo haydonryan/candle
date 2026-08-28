@@ -426,11 +426,19 @@ pub struct DeepseekV4Quantized {
 
 impl DeepseekV4Quantized {
     /// `paths` are the safetensors shards (any order; `multi` merges by name).
-    /// `block` is the fp8/fp4 dequant block (real V4-Flash: `(128, 128)`).
+    /// `block` is the fp8/fp4 dequant block (synthetic V4-Flash sample: `(128, 128)`).
     /// `scale_suffix` is appended to a weight name to find its scale tensor
-    /// (real V4-Flash: `"_scale_inv"`). `fp4_prefixes` name the expert tensors
-    /// stored as FP4 E2M1 (real V4-Flash: `experts.gate_up_proj`/`down_proj`).
-    /// `max_bytes` caps the resident dequantized weight cache.
+    /// (synthetic sample: `"_scale_inv"`). `fp4_prefixes` name the expert tensors
+    /// stored as FP4 E2M1 (synthetic sample: `experts.gate_up_proj`/`down_proj`).
+    ///
+    /// NOTE: the real `deepseek-ai/DeepSeek-V4-Flash` checkpoint uses a different
+    /// schema this loader does not yet support: weight names are
+    /// `embed.weight` / `layers.N.attn.*` / `layers.N.ffn.*`, scale tensors are
+    /// `<weight>.scale` (`.weight` -> `.scale`), routed experts are per-expert
+    /// `ffn.experts.N.w1/w2/w3` in a proprietary FP4 layout (I8-packed with
+    /// non-(128,128) block scales) rather than a stacked `gate_up_proj`/`down_proj`,
+    /// and compressor weights are plain BF16. Loading the real checkpoint requires
+    /// a name/layout remap plus that FP4 dequant; see story #4272 task 15527.
     ///
     /// # Safety
     ///

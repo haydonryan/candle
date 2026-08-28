@@ -102,6 +102,21 @@ fn default_topk_method() -> TopkMethod {
 fn default_scoring_func() -> ScoringFunc {
     ScoringFunc::Softmax
 }
+fn default_partial_rotary_factor() -> f64 {
+    // `qk_rope_head_dim` (64) / `head_dim` (512), as in transformers.
+    64.0 / 512.0
+}
+
+fn default_router_aux_loss_coef() -> f64 {
+    0.001
+}
+
+fn default_compress_rates() -> CompressRates {
+    CompressRates {
+        compressed_sparse_attention: 4,
+        heavily_compressed_attention: 128,
+    }
+}
 
 /// DeepSeek-V4 configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +143,7 @@ pub struct DeepseekV4Config {
     pub hc_mult: usize,
     pub hc_sinkhorn_iters: usize,
     pub hc_eps: f64,
+    #[serde(default = "default_partial_rotary_factor")]
     pub partial_rotary_factor: f64,
     pub sliding_window: usize,
     pub max_position_embeddings: usize,
@@ -136,11 +152,15 @@ pub struct DeepseekV4Config {
     pub compress_rope_theta: f32,
     pub attention_bias: bool,
     pub attention_dropout: f64,
+    #[serde(default)]
     pub mlp_bias: bool,
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
+    #[serde(default)]
     pub output_router_logits: bool,
+    #[serde(default = "default_router_aux_loss_coef")]
     pub router_aux_loss_coef: f64,
+    #[serde(default)]
     pub router_jitter_noise: f64,
     #[serde(default = "default_routed_scaling_factor")]
     pub routed_scaling_factor: f64,
@@ -158,8 +178,10 @@ pub struct DeepseekV4Config {
     pub bos_token_id: usize,
     pub eos_token_id: usize,
     pub pad_token_id: Option<usize>,
+    #[serde(default = "default_compress_rates")]
     pub compress_rates: CompressRates,
     pub compress_ratios: Vec<usize>,
+    #[serde(default)]
     pub layer_types: Vec<LayerType>,
     pub rope_scaling: RopeScaling,
 }
@@ -193,7 +215,7 @@ impl DeepseekV4Config {
     /// Compressor layers (CSA/HCA) use `compress_rope_theta` (e.g. 160000) with
     /// Yarn scaling; plain sliding-attention layers use `rope_theta` (e.g. 10000).
     pub fn layer_configs(&self) -> Vec<LayerConfig> {
-        self.layer_types
+        self.effective_layer_types()
             .iter()
             .map(|&layer_type| {
                 let compress = layer_type != LayerType::SlidingAttention;
@@ -208,6 +230,24 @@ impl DeepseekV4Config {
                     use_yarn: compress,
                 }
             })
+            .collect()
+    }
+
+    /// Resolve the per-layer attention schedule, deriving it from the legacy
+    /// `compress_ratios` per-layer ints (`0`/`4`/`128`) when the config ships no
+    /// explicit `layer_types` (as the real DeepSeek-V4-Flash config does).
+    pub fn effective_layer_types(&self) -> Vec<LayerType> {
+        if !self.layer_types.is_empty() {
+            return self.layer_types.clone();
+        }
+        self.compress_ratios
+            .iter()
+            .map(|&r| match r {
+                4 => LayerType::CompressedSparseAttention,
+                128 => LayerType::HeavilyCompressedAttention,
+                _ => LayerType::SlidingAttention,
+            })
+            .take(self.num_hidden_layers)
             .collect()
     }
 }
@@ -673,7 +713,8 @@ impl DeepseekV4Attention {
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
-        let rope_variant = if cfg.layer_types[layer_idx] == LayerType::SlidingAttention {
+        let rope_variant = if cfg.effective_layer_types()[layer_idx] == LayerType::SlidingAttention
+        {
             RopeVariant::Main
         } else {
             RopeVariant::Compress
@@ -701,8 +742,11 @@ impl DeepseekV4Attention {
             vb.pp("o_b_proj"),
         )?;
         let sinks = vb.get((num_heads,), "sinks")?;
-        let compressor =
-            DeepseekV4Compressor::new(cfg, cfg.layer_types[layer_idx], vb.pp("compressor"))?;
+        let compressor = DeepseekV4Compressor::new(
+            cfg,
+            cfg.effective_layer_types()[layer_idx],
+            vb.pp("compressor"),
+        )?;
         Ok(Self {
             q_a_proj,
             q_a_norm,
@@ -918,7 +962,7 @@ struct DeepseekV4PagedLayer {
 
 impl DeepseekV4PagedLayer {
     fn new(cfg: &DeepseekV4Config, layer_idx: usize, num_sequences: usize) -> Self {
-        let comp_state = match cfg.layer_types[layer_idx] {
+        let comp_state = match cfg.effective_layer_types()[layer_idx] {
             LayerType::SlidingAttention => {
                 vec![DeepseekV4CompressorState::None; num_sequences]
             }
@@ -2800,6 +2844,64 @@ mod tests {
         assert_eq!(layers[3].layer_type, LayerType::HeavilyCompressedAttention);
         assert_eq!(layers[3].compress_rate, 128);
         assert_eq!(layers[3].rope_theta, 160_000.0);
+        assert!(layers[3].use_yarn);
+    }
+
+    /// The real deepseek-ai DeepSeek-V4-Flash `config.json` ships neither
+    /// `layer_types` nor `compress_rates`, and omits `partial_rotary_factor`,
+    /// `mlp_bias`, `output_router_logits`, `router_aux_loss_coef` and
+    /// `router_jitter_noise`. It MUST still deserialize, with `layer_types`
+    /// derived from the legacy per-layer `compress_ratios` (`0`/`4`/`128`) and
+    /// the scalar defaults taken from transformers (partial_rotary_factor =
+    /// `qk_rope_head_dim/head_dim` = 0.125, compress_rates = {4, 128}).
+    #[test]
+    fn real_flash_config_defaults_and_layer_types_derivation() {
+        let cfg: DeepseekV4Config = serde_json::from_str(
+            r#"{
+                "vocab_size": 129280, "hidden_size": 4096, "moe_intermediate_size": 2048,
+                "num_hidden_layers": 43, "num_attention_heads": 64, "num_key_value_heads": 1,
+                "head_dim": 512, "q_lora_rank": 1024, "o_lora_rank": 1024, "qk_rope_head_dim": 64,
+                "n_routed_experts": 256, "n_shared_experts": 1, "num_experts_per_tok": 6,
+                "num_nextn_predict_layers": 1, "o_groups": 8, "num_hash_layers": 3,
+                "index_head_dim": 128, "index_n_heads": 64, "index_topk": 512, "hc_mult": 4,
+                "hc_sinkhorn_iters": 20, "hc_eps": 1e-6, "sliding_window": 128,
+                "max_position_embeddings": 1048576, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "compress_rope_theta": 160000.0, "attention_bias": false, "attention_dropout": 0.0,
+                "swiglu_limit": 10.0, "initializer_range": 0.02, "use_cache": true,
+                "bos_token_id": 0, "eos_token_id": 1, "tie_word_embeddings": false,
+                "compress_ratios": [0,0,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,0],
+                "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16, "original_max_position_embeddings": 65536, "type": "yarn"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.head_dim, 512);
+        assert_eq!(cfg.num_hidden_layers, 43);
+        assert_eq!(cfg.qk_rope_head_dim, 64);
+        assert_eq!(cfg.partial_rotary_factor, 64.0 / 512.0);
+        assert_eq!(cfg.mlp_bias, false);
+        assert_eq!(cfg.output_router_logits, false);
+        assert_eq!(cfg.router_aux_loss_coef, 0.001);
+        assert_eq!(cfg.router_jitter_noise, 0.0);
+        assert_eq!(cfg.compress_rates.compressed_sparse_attention, 4);
+        assert_eq!(cfg.compress_rates.heavily_compressed_attention, 128);
+
+        // layer_types derived from compress_ratios: 0->sliding, 4->CSA, 128->HCA.
+        let lt = cfg.effective_layer_types();
+        assert_eq!(lt.len(), 43);
+        assert_eq!(lt[0], LayerType::SlidingAttention);
+        assert_eq!(lt[1], LayerType::SlidingAttention);
+        assert_eq!(lt[2], LayerType::CompressedSparseAttention);
+        assert_eq!(lt[3], LayerType::HeavilyCompressedAttention);
+        // 44 compress_ratios vs 43 layers: the trailing `0` (index 43) is truncated,
+        // so the final kept layer (index 42, ratio 4) is a CSA compressor.
+        assert_eq!(lt[42], LayerType::CompressedSparseAttention);
+
+        let layers = cfg.layer_configs();
+        assert_eq!(layers.len(), 43);
+        assert_eq!(layers[0].layer_type, LayerType::SlidingAttention);
+        assert_eq!(layers[3].layer_type, LayerType::HeavilyCompressedAttention);
+        assert_eq!(layers[3].compress_rate, 128);
         assert!(layers[3].use_yarn);
     }
 
