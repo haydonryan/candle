@@ -2314,7 +2314,8 @@ impl DeepseekV4TopKRouter {
         let scores = sqrt_softplus(&logits)?;
         // The optional bias is F32 zeros when the checkpoint omits it; bring it
         // to the score dtype (BF16 for the real model) before adding.
-        let biased = scores.broadcast_add(&self.e_score_correction_bias.to_dtype(scores.dtype())?)?;
+        let biased =
+            scores.broadcast_add(&self.e_score_correction_bias.to_dtype(scores.dtype())?)?;
         let indices = topk_last_dim(&biased, self.top_k)?; // [N, K]
         let weights = scores.gather(&indices, D::Minus1)?; // [N, K]
         let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
@@ -2883,8 +2884,8 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 43);
         assert_eq!(cfg.qk_rope_head_dim, 64);
         assert_eq!(cfg.partial_rotary_factor, 64.0 / 512.0);
-        assert_eq!(cfg.mlp_bias, false);
-        assert_eq!(cfg.output_router_logits, false);
+        assert!(!cfg.mlp_bias);
+        assert!(!cfg.output_router_logits);
         assert_eq!(cfg.router_aux_loss_coef, 0.001);
         assert_eq!(cfg.router_jitter_noise, 0.0);
         assert_eq!(cfg.compress_rates.compressed_sparse_attention, 4);

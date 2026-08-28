@@ -183,8 +183,10 @@ fn main() -> Result<()> {
         println!("DETERMINISM second forward in {:?}", t.elapsed());
         let a = logits.flatten_all()?.to_vec1::<f32>()?;
         let b = logits2.flatten_all()?.to_vec1::<f32>()?;
-        let same =
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+        let same = a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits());
         println!("DETERMINISM: bit-identical = {same}");
     }
 

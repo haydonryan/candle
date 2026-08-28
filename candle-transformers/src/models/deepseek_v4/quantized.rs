@@ -23,9 +23,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use super::{
-    DeepseekV4Config, DeepseekV4DecoderLayer, DeepseekV4ForCausalLM, DeepseekV4HyperHead,
-};
+use super::{DeepseekV4Config, DeepseekV4DecoderLayer, DeepseekV4ForCausalLM, DeepseekV4HyperHead};
 use candle::safetensors::MmapedSafetensors;
 
 /// FP8 E4M3 -> f32: sign(1) exp(4) mantissa(3), exponent bias 7.
@@ -566,6 +564,7 @@ impl DeepseekV4Quantized {
     /// # Safety
     ///
     /// The unsafe is inherited from mmap'ing the shard files.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         paths: &[impl AsRef<Path>],
         block: (usize, usize),
@@ -789,11 +788,8 @@ impl DeepseekV4Quantized {
         let out_dtype = self.out_dtype;
 
         // Shared root weights — resident for the whole forward (small).
-        let root = VarBuilder::new_with_args(
-            Box::new(QuantizedBackend { loader: self }),
-            out_dtype,
-            dev,
-        );
+        let root =
+            VarBuilder::new_with_args(Box::new(QuantizedBackend { loader: self }), out_dtype, dev);
         let embed_tokens = candle_nn::embedding(
             cfg.vocab_size,
             cfg.hidden_size,
@@ -815,7 +811,10 @@ impl DeepseekV4Quantized {
 
         for i in 0..cfg.num_hidden_layers {
             let layer_vb = VarBuilder::new_with_args(
-                Box::new(LayerBackend { loader: self, layer: i }),
+                Box::new(LayerBackend {
+                    loader: self,
+                    layer: i,
+                }),
                 out_dtype,
                 dev,
             );
@@ -831,11 +830,8 @@ impl DeepseekV4Quantized {
         let collapsed = hc_head.forward(&hidden)?; // [B,S,D]
         let out = norm.forward(&collapsed)?;
 
-        let head_vb = VarBuilder::new_with_args(
-            Box::new(QuantizedBackend { loader: self }),
-            out_dtype,
-            dev,
-        );
+        let head_vb =
+            VarBuilder::new_with_args(Box::new(QuantizedBackend { loader: self }), out_dtype, dev);
         let lm_head =
             candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, head_vb.pp("lm_head"))?;
         lm_head.forward(&out)
@@ -868,9 +864,7 @@ impl SimpleBackend for QuantizedBackend<'_> {
         // `tid2eid`); fall back to the on-disk shape.
         let dims = if self.loader.real_schema {
             match real_schema_target(name) {
-                Some(RealTarget::Single(real)) => {
-                    self.loader.st.get(&real)?.shape().to_vec()
-                }
+                Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
                 _ => self.loader.st.get(name)?.shape().to_vec(),
             }
         } else {
@@ -1645,20 +1639,20 @@ mod tests {
 
         // Determinism: a second forward (fresh KV cache) matches exactly.
         let logits2 = {
-            let mut m =                 unsafe {
-                    load_quantized_for_causal_lm(
-                        &cfg,
-                        false,
-                        &paths,
-                        &dev,
-                        DType::F32,
-                        block,
-                        scale_suffix,
-                        &fp4_prefixes,
-                        budget,
-                        false,
-                    )?
-                };
+            let mut m = unsafe {
+                load_quantized_for_causal_lm(
+                    &cfg,
+                    false,
+                    &paths,
+                    &dev,
+                    DType::F32,
+                    block,
+                    scale_suffix,
+                    &fp4_prefixes,
+                    budget,
+                    false,
+                )?
+            };
             m.forward(&ids, 0)?
         };
         assert_close(&logits, &logits2, 0.0, "deterministic");
@@ -1707,8 +1701,14 @@ mod tests {
             "model.layers.0.self_attn.q_a_proj.weight",
             "layers.0.attn.wq_a.weight",
         );
-        single("model.layers.7.self_attn.kv_proj.weight", "layers.7.attn.wkv.weight");
-        single("model.layers.42.self_attn.o_b_proj.weight", "layers.42.attn.wo_b.weight");
+        single(
+            "model.layers.7.self_attn.kv_proj.weight",
+            "layers.7.attn.wkv.weight",
+        );
+        single(
+            "model.layers.42.self_attn.o_b_proj.weight",
+            "layers.42.attn.wo_b.weight",
+        );
         single("model.layers.3.self_attn.sinks", "layers.3.attn.attn_sink");
         single(
             "model.layers.5.input_layernorm.weight",
@@ -1719,7 +1719,10 @@ mod tests {
             "layers.5.ffn_norm.weight",
         );
         single("model.layers.1.mlp.gate.weight", "layers.1.ffn.gate.weight");
-        single("model.layers.1.mlp.gate.tid2eid", "layers.1.ffn.gate.tid2eid");
+        single(
+            "model.layers.1.mlp.gate.tid2eid",
+            "layers.1.ffn.gate.tid2eid",
+        );
         single(
             "model.layers.9.mlp.shared_experts.gate_proj.weight",
             "layers.9.ffn.shared_experts.w1.weight",
@@ -1800,8 +1803,7 @@ mod tests {
         let out = dequantize_fp4_block_scale(&packed, &scale, 2, 8, (1, 8)).unwrap();
         let expected = [
             // row0 (scale 1.0)
-            1.0, 1.5, 2.0, 3.0, -1.0, -1.5, 0.5, 1.0,
-            // row1 (scale 2.0)
+            1.0, 1.5, 2.0, 3.0, -1.0, -1.5, 0.5, 1.0, // row1 (scale 2.0)
             1.0, 2.0, 3.0, 4.0, 6.0, 1.0, 2.0, 3.0,
         ];
         assert_eq!(out.len(), 16);
@@ -1859,7 +1861,12 @@ mod tests {
         push("embed.weight".into(), 0, vec![cfg.vocab_size, h], &mut plan);
         push("head.weight".into(), 0, vec![cfg.vocab_size, h], &mut plan);
         push("norm.weight".into(), 0, vec![h], &mut plan);
-        push("hc_head_fn".into(), 0, vec![cfg.hc_mult, cfg.hc_mult * h], &mut plan);
+        push(
+            "hc_head_fn".into(),
+            0,
+            vec![cfg.hc_mult, cfg.hc_mult * h],
+            &mut plan,
+        );
         push("hc_head_base".into(), 0, vec![cfg.hc_mult], &mut plan);
         push("hc_head_scale".into(), 0, vec![1], &mut plan);
         for li in 0..cfg.num_hidden_layers {
@@ -1867,42 +1874,99 @@ mod tests {
             // attention (fp8)
             for (k, shape) in [
                 ("attn.wq_a.weight", vec![cfg.q_lora_rank, h]),
-                ("attn.wq_b.weight", vec![cfg.num_attention_heads * d, cfg.q_lora_rank]),
+                (
+                    "attn.wq_b.weight",
+                    vec![cfg.num_attention_heads * d, cfg.q_lora_rank],
+                ),
                 ("attn.wkv.weight", vec![d, h]),
-                ("attn.wo_a.weight", vec![cfg.o_groups * cfg.o_lora_rank, cfg.num_attention_heads * d / cfg.o_groups]),
+                (
+                    "attn.wo_a.weight",
+                    vec![
+                        cfg.o_groups * cfg.o_lora_rank,
+                        cfg.num_attention_heads * d / cfg.o_groups,
+                    ],
+                ),
                 ("attn.wo_b.weight", vec![h, cfg.o_groups * cfg.o_lora_rank]),
             ] {
                 push(format!("{l}.{k}"), 1, shape, &mut plan);
             }
-            push(format!("{l}.attn.q_norm.weight"), 0, vec![cfg.q_lora_rank], &mut plan);
+            push(
+                format!("{l}.attn.q_norm.weight"),
+                0,
+                vec![cfg.q_lora_rank],
+                &mut plan,
+            );
             push(format!("{l}.attn.kv_norm.weight"), 0, vec![d], &mut plan);
-            push(format!("{l}.attn.attn_sink"), 0, vec![cfg.num_attention_heads], &mut plan);
+            push(
+                format!("{l}.attn.attn_sink"),
+                0,
+                vec![cfg.num_attention_heads],
+                &mut plan,
+            );
             push(format!("{l}.attn_norm.weight"), 0, vec![h], &mut plan);
             push(format!("{l}.ffn_norm.weight"), 0, vec![h], &mut plan);
             push(format!("{l}.ffn.gate.weight"), 0, vec![e, h], &mut plan);
-            push(format!("{l}.ffn.gate.tid2eid"), 3, vec![cfg.vocab_size, cfg.num_experts_per_tok], &mut plan);
+            push(
+                format!("{l}.ffn.gate.tid2eid"),
+                3,
+                vec![cfg.vocab_size, cfg.num_experts_per_tok],
+                &mut plan,
+            );
             for ei in 0..e {
                 for w in ["w1", "w3"] {
-                    push(format!("{l}.ffn.experts.{ei}.{w}.weight"), 2, vec![inter, h], &mut plan);
+                    push(
+                        format!("{l}.ffn.experts.{ei}.{w}.weight"),
+                        2,
+                        vec![inter, h],
+                        &mut plan,
+                    );
                 }
-                push(format!("{l}.ffn.experts.{ei}.w2.weight"), 2, vec![h, inter], &mut plan);
+                push(
+                    format!("{l}.ffn.experts.{ei}.w2.weight"),
+                    2,
+                    vec![h, inter],
+                    &mut plan,
+                );
             }
-            push(format!("{l}.ffn.shared_experts.w1.weight"), 1, vec![inter, h], &mut plan);
-            push(format!("{l}.ffn.shared_experts.w3.weight"), 1, vec![inter, h], &mut plan);
-            push(format!("{l}.ffn.shared_experts.w2.weight"), 1, vec![h, inter], &mut plan);
-            push(format!("{l}.hc_attn_fn"), 0, vec![mix, cfg.hc_mult * h], &mut plan);
+            push(
+                format!("{l}.ffn.shared_experts.w1.weight"),
+                1,
+                vec![inter, h],
+                &mut plan,
+            );
+            push(
+                format!("{l}.ffn.shared_experts.w3.weight"),
+                1,
+                vec![inter, h],
+                &mut plan,
+            );
+            push(
+                format!("{l}.ffn.shared_experts.w2.weight"),
+                1,
+                vec![h, inter],
+                &mut plan,
+            );
+            push(
+                format!("{l}.hc_attn_fn"),
+                0,
+                vec![mix, cfg.hc_mult * h],
+                &mut plan,
+            );
             push(format!("{l}.hc_attn_base"), 0, vec![mix], &mut plan);
             push(format!("{l}.hc_attn_scale"), 0, vec![3], &mut plan);
-            push(format!("{l}.hc_ffn_fn"), 0, vec![mix, cfg.hc_mult * h], &mut plan);
+            push(
+                format!("{l}.hc_ffn_fn"),
+                0,
+                vec![mix, cfg.hc_mult * h],
+                &mut plan,
+            );
             push(format!("{l}.hc_ffn_base"), 0, vec![mix], &mut plan);
             push(format!("{l}.hc_ffn_scale"), 0, vec![3], &mut plan);
         }
 
-        let mut wi = 0usize;
-        for (name, kind, shape) in plan {
+        for (wi, (name, kind, shape)) in plan.into_iter().enumerate() {
             let n_elems: usize = shape.iter().product();
             let vals = lcg(seed.wrapping_add(wi as u64 * 104729), n_elems);
-            wi += 1;
             let rank = shape.len();
             let (rows, cols) = (shape[..rank - 1].iter().product(), shape[rank - 1]);
             match kind {
@@ -1950,8 +2014,7 @@ mod tests {
 
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("v4q_real_{}_{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("v4q_real_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let p = dir.join("model.safetensors");
         write_st(&p, &shards);
@@ -1986,7 +2049,10 @@ mod tests {
         let logits = model.forward(&ids, 0)?;
         assert_eq!(logits.dims(), &[1, 5, cfg.vocab_size], "logits shape");
         let flat = logits.flatten_all()?.to_vec1::<f32>()?;
-        assert!(flat.iter().all(|v| v.is_finite()), "real-schema logits finite");
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "real-schema logits finite"
+        );
 
         // Determinism: a second load + forward matches exactly.
         let mut m2 = unsafe {
@@ -2024,9 +2090,8 @@ mod tests {
 
         let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?;
 
-        let loader = unsafe {
-            DeepseekV4Quantized::new_real(&paths, dev.clone(), DType::F32, budget)?
-        };
+        let loader =
+            unsafe { DeepseekV4Quantized::new_real(&paths, dev.clone(), DType::F32, budget)? };
         // Streaming path: only one layer's weights resident at a time.
         let logits_stream = loader.forward_real(&cfg, false, &ids, 0)?;
         assert_eq!(
@@ -2063,5 +2128,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(paths[0].parent().unwrap());
         Ok(())
     }
-
 }
