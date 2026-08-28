@@ -35,8 +35,10 @@ struct Args {
 
     /// Resident GPU weight cache budget in bytes — how many layers' dequantized
     /// weights are kept on the GPU (LRU) instead of being dropped after each
-    /// layer. Size toward the available VRAM (e.g. 85 GiB on a 96 GB card).
-    #[arg(long, default_value_t = 80_000_000_000)]
+    /// layer. Size toward the available VRAM; 64 GiB holds ~10 layers and fits
+    /// a 96 GB card with headroom for activations + CUDA allocator pooling
+    /// (budgets near the card limit OOM).
+    #[arg(long, default_value_t = 68_719_476_736)]
     gpu_budget_bytes: usize,
 
     /// fp8/fp4 dequant block.
@@ -193,8 +195,14 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let logits2 = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
         println!("DETERMINISM second forward in {:?}", t.elapsed());
-        let a = logits.flatten_all()?.to_vec1::<f32>()?;
-        let b = logits2.flatten_all()?.to_vec1::<f32>()?;
+        let a = logits
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let b = logits2
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         let same = a.len() == b.len()
             && a.iter()
                 .zip(b.iter())
@@ -226,7 +234,7 @@ fn main() -> Result<()> {
     }
 
     let flat = logits.flatten_all()?;
-    let f = flat.to_vec1::<f32>()?;
+    let f = flat.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let finite = f.iter().all(|x| x.is_finite());
     let n_nan = f.iter().filter(|x| x.is_nan()).count();
     let n_inf = f.iter().filter(|x| x.is_infinite()).count();
@@ -245,7 +253,10 @@ fn main() -> Result<()> {
     );
 
     // Top-5 argmax at the last token as a sanity signal.
-    let last = logits.i((0, tokens.len() - 1, ..))?.to_vec1::<f32>()?;
+    let last = logits
+        .i((0, tokens.len() - 1, ..))?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
     let mut idx: Vec<usize> = (0..last.len()).collect();
     idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap());
     let toks: Vec<_> = idx[..5].to_vec();
