@@ -15,6 +15,8 @@ use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
+#[cfg(feature = "cuda")]
+pub mod fp8_gemm;
 /// DeepSeek-V4 fp8/fp4 quantized weight loading + CPU/disk offload.
 pub mod quantized;
 
