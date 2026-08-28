@@ -20,6 +20,63 @@ pub mod fp8_gemm;
 /// DeepSeek-V4 fp8/fp4 quantized weight loading + CPU/disk offload.
 pub mod quantized;
 
+/// Shared cuBLASLt handle used for the fp8-compute path (fp8 x fp8 GEMM with
+/// fp32 accumulation). Wrapped in `RefCell` so it can be borrowed mutably from
+/// `&self` methods (attention forward is `&mut self`, MoE forward is `&self`).
+#[cfg(feature = "cuda")]
+struct Fp8Compute {
+    blas: std::cell::RefCell<fp8_gemm::BlasLt>,
+}
+
+#[cfg(feature = "cuda")]
+impl Fp8Compute {
+    fn new(dev: &Device) -> Result<Self> {
+        let stream = dev.as_cuda_device()?.cuda_stream();
+        Ok(Self {
+            blas: std::cell::RefCell::new(fp8_gemm::BlasLt::new(stream)?),
+        })
+    }
+
+    fn linear(&self, act: &Tensor, w: &fp8_gemm::Fp8Weight, out_dtype: DType) -> Result<Tensor> {
+        fp8_gemm::fp8_linear(&mut self.blas.borrow_mut(), act, w, out_dtype)
+    }
+
+    fn grouped_linear(
+        &self,
+        act: &Tensor,
+        w: &fp8_gemm::Fp8Weight,
+        n_groups: usize,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        fp8_gemm::fp8_grouped_linear(&mut self.blas.borrow_mut(), act, w, n_groups, out_dtype)
+    }
+}
+
+/// fp8-compute state for the attention projections: the cuBLASLt engine plus
+/// the fp8-quantized weights of `q_a`, `q_b`, `kv`, the grouped `o_a`, and
+/// `o_b`. Weights stay fp8 on the GPU (no bf16 upcast); activations are
+/// quantized to fp8 per-projection at forward time.
+#[cfg(feature = "cuda")]
+struct AttentionFp8 {
+    compute: Fp8Compute,
+    q_a: fp8_gemm::Fp8Weight,
+    q_b: fp8_gemm::Fp8Weight,
+    kv: fp8_gemm::Fp8Weight,
+    o_a: fp8_gemm::Fp8Weight,
+    o_b: fp8_gemm::Fp8Weight,
+}
+
+/// fp8-compute state for the routed MoE experts: the cuBLASLt engine plus the
+/// fp8-quantized `gate_up_proj` (stacked w1/w2) and `down_proj` (w3), laid out
+/// as `(E * 2 * inter, hidden)` and `(E * hidden, inter)` and narrowed to the
+/// active expert at forward time.
+#[cfg(feature = "cuda")]
+struct ExpertsFp8 {
+    compute: Fp8Compute,
+    gate_up: fp8_gemm::Fp8Weight,
+    down: fp8_gemm::Fp8Weight,
+}
+
 /// Per-layer attention type used by DeepSeek-V4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +255,12 @@ pub struct DeepseekV4Config {
     /// is provided at the transformer layer via dequant (documented decision).
     #[serde(default = "default_fp8_attention")]
     pub use_fp8_attention: bool,
+    /// When true, attention projections and routed MoE experts run on the fp8
+    /// tensor cores (weights kept fp8, fp8 x fp8 GEMM with fp32 accumulation)
+    /// instead of the bf16/fp32 eager matmul. Requires the `cuda` feature and a
+    /// CUDA device. Defaults to false (eager path).
+    #[serde(default)]
+    pub fp8_compute: bool,
 }
 
 /// Per-layer derived configuration.
@@ -628,6 +691,8 @@ pub struct DeepseekV4Attention {
     kv_cache_scale: Option<Tensor>,
     compressor: Option<DeepseekV4Compressor>,
     use_flash_attn: bool,
+    #[cfg(feature = "cuda")]
+    fp8: Option<AttentionFp8>,
     cfg: DeepseekV4Config,
 }
 
@@ -805,6 +870,20 @@ impl DeepseekV4Attention {
             cfg.effective_layer_types()[layer_idx],
             vb.pp("compressor"),
         )?;
+        #[cfg(feature = "cuda")]
+        let fp8 = if cfg.fp8_compute {
+            let compute = Fp8Compute::new(vb.device())?;
+            Some(AttentionFp8 {
+                q_a: fp8_gemm::Fp8Weight::from_tensor(&q_a_proj.weight())?,
+                q_b: fp8_gemm::Fp8Weight::from_tensor(&q_b_proj.weight())?,
+                kv: fp8_gemm::Fp8Weight::from_tensor(&kv_proj.weight())?,
+                o_a: fp8_gemm::Fp8Weight::from_tensor(&o_a_proj.weight)?,
+                o_b: fp8_gemm::Fp8Weight::from_tensor(&o_b_proj.weight())?,
+                compute,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             q_a_proj,
             q_a_norm,
@@ -823,6 +902,8 @@ impl DeepseekV4Attention {
             kv_cache_scale: None,
             compressor,
             use_flash_attn,
+            #[cfg(feature = "cuda")]
+            fp8,
             cfg: cfg.clone(),
         })
     }
@@ -832,6 +913,54 @@ impl DeepseekV4Attention {
         if let Some(c) = &mut self.compressor {
             c.clear_cache();
         }
+    }
+
+    /// Query-A projection: fp8-compute when enabled, eager matmul otherwise.
+    fn q_a_apply(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            return f.compute.linear(xs, &f.q_a, xs.dtype());
+        }
+        self.q_a_proj.forward(xs)
+    }
+
+    /// Query-B projection: fp8-compute when enabled, eager matmul otherwise.
+    fn q_b_apply(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            return f.compute.linear(x, &f.q_b, x.dtype());
+        }
+        self.q_b_proj.forward(x)
+    }
+
+    /// KV projection: fp8-compute when enabled, eager matmul otherwise.
+    fn kv_apply(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            return f.compute.linear(xs, &f.kv, xs.dtype());
+        }
+        self.kv_proj.forward(xs)
+    }
+
+    /// Grouped output-A projection: fp8-compute when enabled, eager matmul
+    /// otherwise.
+    fn o_a_apply(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            return f
+                .compute
+                .grouped_linear(x, &f.o_a, self.cfg.o_groups, x.dtype());
+        }
+        self.o_a_proj.forward(x)
+    }
+
+    /// Output-B projection: fp8-compute when enabled, eager matmul otherwise.
+    fn o_b_apply(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            return f.compute.linear(x, &f.o_b, x.dtype());
+        }
+        self.o_b_proj.forward(x)
     }
 
     /// Sliding-window causal additive mask over `(q_len, kv_len)`.
@@ -920,10 +1049,9 @@ impl DeepseekV4Attention {
         let variant = self.rope_variant;
 
         // Query: q_a -> RMSNorm -> q_b -> UnweightedRMSNorm.
-        let q_residual = self.q_a_norm.forward(&self.q_a_proj.forward(xs)?)?;
+        let q_residual = self.q_a_norm.forward(&self.q_a_apply(xs)?)?;
         let q = self
-            .q_b_proj
-            .forward(&q_residual)?
+            .q_b_apply(&q_residual)?
             .reshape((bs, seq_len, num_heads, head_dim))?
             .transpose(1, 2)?;
         let q = self.q_b_norm.forward(&q)?;
@@ -932,7 +1060,7 @@ impl DeepseekV4Attention {
         // Single shared KV head (K == V).
         let kv = self
             .kv_norm
-            .forward(&self.kv_proj.forward(xs)?)?
+            .forward(&self.kv_apply(xs)?)?
             .reshape((bs, seq_len, 1, head_dim))?
             .transpose(1, 2)?;
         let kv = self.rotary_emb.forward(&kv, variant, seqlen_offset)?;
@@ -1051,9 +1179,9 @@ impl DeepseekV4Attention {
             self.cfg.o_groups,
             num_heads * head_dim / self.cfg.o_groups,
         ))?;
-        let grouped = self.o_a_proj.forward(&grouped)?;
+        let grouped = self.o_a_apply(&grouped)?;
         let grouped = grouped.reshape((bs, seq_len, self.cfg.o_groups * self.cfg.o_lora_rank))?;
-        self.o_b_proj.forward(&grouped)
+        self.o_b_apply(&grouped)
     }
 }
 
@@ -2332,6 +2460,8 @@ pub struct DeepseekV4Experts {
     gate_up_proj: Tensor,
     down_proj: Tensor,
     limit: f64,
+    #[cfg(feature = "cuda")]
+    fp8: Option<ExpertsFp8>,
 }
 
 impl DeepseekV4Experts {
@@ -2341,12 +2471,61 @@ impl DeepseekV4Experts {
         let hidden = cfg.hidden_size;
         let gate_up_proj = vb.get((e, 2 * inter, hidden), "gate_up_proj")?;
         let down_proj = vb.get((e, hidden, inter), "down_proj")?;
+        #[cfg(feature = "cuda")]
+        let fp8 = if cfg.fp8_compute {
+            let compute = Fp8Compute::new(vb.device())?;
+            // Flatten to `(E * rows, cols)` so each expert occupies a contiguous
+            // row block (gate_up `[E, 2*inter, hidden]`, down `[E, hidden, inter]`).
+            let gate_up = gate_up_proj.reshape((e * 2 * inter, hidden))?;
+            let down = down_proj.reshape((e * hidden, inter))?;
+            Some(ExpertsFp8 {
+                gate_up: fp8_gemm::Fp8Weight::from_tensor(&gate_up)?,
+                down: fp8_gemm::Fp8Weight::from_tensor(&down)?,
+                compute,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             num_experts: e,
             gate_up_proj,
             down_proj,
             limit: cfg.swiglu_limit,
+            #[cfg(feature = "cuda")]
+            fp8,
         })
+    }
+
+    /// gate_up projection for expert `i`: fp8-compute when enabled (weights
+    /// kept fp8, activation quantized to fp8), eager matmul otherwise.
+    fn gate_up_apply(&self, x: &Tensor, i: usize) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            let rows = self.gate_up_proj.dim(1)?; // 2*inter
+            let sub = fp8_gemm::Fp8Weight {
+                bytes: f.gate_up.bytes.narrow(0, i * rows, rows)?,
+                scale: f.gate_up.scale,
+            };
+            return f.compute.linear(x, &sub, x.dtype());
+        }
+        let gu = self.gate_up_proj.narrow(0, i, 1)?.squeeze(0)?; // [2*inter, hidden]
+        x.matmul(&gu.t()?)
+    }
+
+    /// down projection for expert `i`: fp8-compute when enabled (weights kept
+    /// fp8, activation quantized to fp8), eager matmul otherwise.
+    fn down_apply(&self, x: &Tensor, i: usize) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(f) = &self.fp8 {
+            let rows = self.down_proj.dim(1)?; // hidden
+            let sub = fp8_gemm::Fp8Weight {
+                bytes: f.down.bytes.narrow(0, i * rows, rows)?,
+                scale: f.down.scale,
+            };
+            return f.compute.linear(x, &sub, x.dtype());
+        }
+        let down_w = self.down_proj.narrow(0, i, 1)?.squeeze(0)?; // [hidden, inter]
+        x.matmul(&down_w.t()?)
     }
 
     /// `hidden_states` is `[N, hidden]`; `top_k_index` and `top_k_weights` are
@@ -2368,14 +2547,12 @@ impl DeepseekV4Experts {
             let sel = top_k_index.eq(i as u32)?; // [N,K] bool
             let w = sel.where_cond(top_k_weights, &zero)?;
             let wsum = w.sum(D::Minus1)?; // [N]
-            let gu = self.gate_up_proj.narrow(0, i, 1)?.squeeze(0)?; // [2*inter, hidden]
-            let all = hidden_states.matmul(&gu.t()?)?; // [N, 2*inter]
+            let all = self.gate_up_apply(hidden_states, i)?; // [N, 2*inter]
             let chunks = all.chunk(2, D::Minus1)?;
             let gate = chunks[0].clamp(f64::NEG_INFINITY, self.limit)?;
             let up = chunks[1].clamp(-self.limit, self.limit)?;
             let act = (candle_nn::ops::silu(&gate)? * up)?; // [N, inter]
-            let down_w = self.down_proj.narrow(0, i, 1)?.squeeze(0)?; // [hidden, inter]
-            let down = act.matmul(&down_w.t()?)?; // [N, hidden]
+            let down = self.down_apply(&act, i)?; // [N, hidden]
             let contrib = down.broadcast_mul(&wsum.unsqueeze(D::Minus1)?)?;
             out = out.add(&contrib)?;
         }
@@ -5045,6 +5222,67 @@ mod tests {
         let ref_logits = ref_model_forward(&cfg, &emb, &weights, &ids, 0, &mut caches)?;
         assert_eq!(logits.dims(), ref_logits.dims(), "logits shape");
         assert_close(&logits, &ref_logits, 1e-4, "model-forward");
+        Ok(())
+    }
+
+    /// fp8-compute forward parity: the same small model run with
+    /// `fp8_compute = true` (attention projections + routed MoE experts on the
+    /// fp8 tensor cores, weights kept fp8) must produce logits within tolerance
+    /// of the bf16/f32-eager forward on the same GPU (story #4332 task 15772).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn deepseek_v4_fp8_forward_parity() -> candle::Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no CUDA device; skipping fp8-forward parity ({e})");
+                return Ok(());
+            }
+        };
+        let mut cfg = model_config();
+        // cuBLASLt fp8 GEMM needs K >= 32; scale the tiny config up to a small
+        // V4-Flash-shaped model (hidden=512, head_dim=64, 16 heads) so the fp8
+        // per-dot-product quantization error (~6%/sqrt(K)) stays small enough
+        // to validate correct logits against the fp32-eager reference.
+        cfg.hidden_size = 512;
+        cfg.moe_intermediate_size = 1024;
+        cfg.num_attention_heads = 16;
+        cfg.head_dim = 64;
+        cfg.q_lora_rank = 256;
+        cfg.o_lora_rank = 256;
+        cfg.o_groups = 4;
+        cfg.vocab_size = 512;
+        cfg.sliding_window = 32;
+        cfg.fp8_compute = true;
+        let weights_cpu = model_weights(&cfg);
+        let weights: HashMap<String, Tensor> = weights_cpu
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_device(&dev).unwrap()))
+            .collect();
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &dev);
+        let mut model = DeepseekV4ForCausalLM::new(&cfg, false, vb)?;
+        let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?; // [1,5]
+        let fp8_logits = model.forward(&ids, 0)?;
+
+        // fp8-eager reference on the same GPU (fp8 compute off).
+        let mut cfg_ref = cfg.clone();
+        cfg_ref.fp8_compute = false;
+        let vb_ref = VarBuilder::from_tensors(weights, DType::F32, &dev);
+        let mut ref_model = DeepseekV4ForCausalLM::new(&cfg_ref, false, vb_ref)?;
+        let ref_logits = ref_model.forward(&ids, 0)?;
+
+        assert_eq!(fp8_logits.dims(), ref_logits.dims(), "fp8 logits shape");
+        let a = fp8_logits.flatten_all()?.to_vec1::<f32>()?;
+        let b = ref_logits.flatten_all()?.to_vec1::<f32>()?;
+        let max_ref = b.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let rel = max_diff / max_ref;
+        println!("fp8 forward rel_err={rel:.4} max_diff={max_diff:.4} max_ref={max_ref:.4}");
+        assert!(rel < 0.2, "fp8 forward rel_err {rel} too large");
         Ok(())
     }
 

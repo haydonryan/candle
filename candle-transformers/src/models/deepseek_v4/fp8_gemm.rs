@@ -264,13 +264,16 @@ fn tensor_ptr<T: candle::cuda::CudaDType>(
     t: &Tensor,
     stream: &Arc<CudaStream>,
 ) -> Result<*const u8> {
-    let (storage, _layout) = t.storage_and_layout();
+    let (storage, layout) = t.storage_and_layout();
     let Storage::Cuda(s) = &*storage else {
         candle::bail!("expected a CUDA tensor, got {:?}", t.device())
     };
     let slice: &cudarc::driver::CudaSlice<T> = s.as_cuda_slice()?;
     let (ptr, _) = slice.device_ptr(stream);
-    Ok(ptr as *const u8)
+    // The tensor may be a view (e.g. per-group/per-expert narrowed rows) whose
+    // data starts at `start_offset` elements into the storage.
+    let byte_off = layout.start_offset() * std::mem::size_of::<T>();
+    Ok(unsafe { (ptr as *const u8).add(byte_off) })
 }
 
 fn alloc_f32(dev: &CudaDevice, len: usize) -> Result<cudarc::driver::CudaSlice<f32>> {
@@ -322,6 +325,92 @@ pub fn fp8_matmul(
 
 fn get_stream(t: &Tensor) -> Result<Arc<CudaStream>> {
     Ok(t.device().as_cuda_device()?.cuda_stream())
+}
+
+/// An fp8-quantized linear weight: `bytes` is the `(out, in)` fp8 tensor
+/// (value = `fp8_e4m3_to_f32`), `scale` is the per-tensor weight scale folded
+/// into `alpha` at GEMM time so that `w ≈ fp8(bytes) / scale`.
+///
+/// Scaling the raw weight by `scale` (≈ `448 / max|w|`) before rounding keeps
+/// the fp8 values near the top of the e4m3 range for maximum precision; the
+/// scale is cancelled by `alpha` in [`fp8_linear`] together with the
+/// activation scale, so the GEMM returns the true `act @ w` product.
+pub struct Fp8Weight {
+    pub bytes: Tensor,
+    pub scale: f32,
+}
+
+impl Fp8Weight {
+    /// Quantize an f32 `(out, in)` weight tensor to fp8.
+    pub fn from_tensor(w: &Tensor) -> Result<Self> {
+        let (out, in_) = w.dims2()?;
+        let v = w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let (bytes, scale) = quantize_fp8(&v);
+        let t = Tensor::from_vec(bytes, (out, in_), w.device())?;
+        Ok(Self { bytes: t, scale })
+    }
+}
+
+/// fp8 linear projection: quantize `act` (`(..., in)`) to fp8, then run
+/// `fp8 x fp8` on the tensor cores against the fp8 weight `w` (`(out, in)`,
+/// scales folded in via [`Fp8Weight`]). Both the activation scale and the
+/// weight scale fold into `alpha`, so the result is `act @ w` (up to fp8
+/// quantization) in `out_dtype` (`(..., out)`).
+pub fn fp8_linear(
+    blas: &mut BlasLt,
+    act: &Tensor,
+    w: &Fp8Weight,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    let rank = act.rank();
+    let in_ = act.dim(rank - 1)?;
+    let out = w.bytes.dim(0)?;
+    let lead: usize = act.dims()[..rank - 1].iter().product();
+    let flat = act
+        .reshape((lead, in_))?
+        .contiguous()?
+        .to_dtype(DType::F32)?;
+    let v = flat.flatten_all()?.to_vec1::<f32>()?;
+    let (a8, act_scale) = quantize_fp8(&v);
+    let a8t = Tensor::from_vec(a8, (lead, in_), act.device())?;
+    let alpha = 1.0 / (act_scale * w.scale);
+    let out_t = fp8_matmul(blas, &a8t, &w.bytes, alpha, out_dtype)?;
+    let mut dims = act.dims()[..rank - 1].to_vec();
+    dims.push(out);
+    out_t.reshape(dims)
+}
+
+/// fp8 grouped low-rank linear (block-diagonal over `n_groups`): `act` is
+/// `(..., n_groups, in_per_group)`, `w` is the `(n_groups * out_per_group,
+/// in_per_group)` fp8 weight (single per-tensor scale). Returns
+/// `(..., n_groups, out_per_group)`.
+pub fn fp8_grouped_linear(
+    blas: &mut BlasLt,
+    act: &Tensor,
+    w: &Fp8Weight,
+    n_groups: usize,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    let ndim = act.rank();
+    let in_per_group = w.bytes.dim(1)?;
+    let out_per_group = w.bytes.dim(0)? / n_groups;
+    let batch: usize = act.dims()[..ndim - 2].iter().product();
+    let xr = act.reshape((batch, n_groups, in_per_group))?;
+    let mut outs = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let act_g = xr.narrow(1, g, 1)?.squeeze(1)?;
+        let sub = Fp8Weight {
+            bytes: w.bytes.narrow(0, g * out_per_group, out_per_group)?,
+            scale: w.scale,
+        };
+        let o_g = fp8_linear(blas, &act_g, &sub, out_dtype)?; // (batch, out_per_group)
+        outs.push(o_g.unsqueeze(1)?);
+    }
+    let y = Tensor::cat(&outs, 1)?; // (batch, n_groups, out_per_group)
+    let mut out_dims = act.dims()[..ndim - 2].to_vec();
+    out_dims.push(n_groups);
+    out_dims.push(out_per_group);
+    y.reshape(out_dims)
 }
 
 /// Fold a `[bn, bk]` ue8m0 block scale into a raw fp8 weight, exactly.
