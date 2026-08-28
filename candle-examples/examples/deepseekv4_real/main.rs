@@ -33,6 +33,14 @@ struct Args {
     #[arg(long, default_value_t = 80_000_000_000)]
     offload_budget_bytes: usize,
 
+    /// Resident GPU weight cache budget in bytes — how many layers' dequantized
+    /// weights are kept on the GPU (LRU) instead of being dropped after each
+    /// layer. Size toward the available VRAM; 64 GiB holds ~10 layers and fits
+    /// a 96 GB card with headroom for activations + CUDA allocator pooling
+    /// (budgets near the card limit OOM).
+    #[arg(long, default_value_t = 68_719_476_736)]
+    gpu_budget_bytes: usize,
+
     /// fp8/fp4 dequant block.
     #[arg(long, default_value_t = 128)]
     block: usize,
@@ -130,6 +138,7 @@ fn main() -> Result<()> {
                 device.clone(),
                 DType::BF16,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let load_time = t0.elapsed(); // open mmaps; weights are loaded lazily per layer
@@ -137,10 +146,13 @@ fn main() -> Result<()> {
         let logits = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
         let fwd_time = t1.elapsed();
         println!(
-            "STREAMING: resident_bytes={} cached_len={} evictions={}",
+            "STREAMING: resident_bytes={} cached_len={} evictions={} gpu_bytes={} gpu_cached={} gpu_evict={}",
             loader.resident_bytes(),
             loader.cached_len(),
-            loader.evictions()
+            loader.evictions(),
+            loader.gpu_resident_bytes(),
+            loader.gpu_cached_len(),
+            loader.gpu_evictions()
         );
         (logits, load_time, fwd_time)
     } else {
@@ -156,6 +168,7 @@ fn main() -> Result<()> {
                 scale_suffix,
                 &fp4_prefixes,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
                 true,
             )?
         };
@@ -176,13 +189,20 @@ fn main() -> Result<()> {
                 device.clone(),
                 DType::BF16,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let t = std::time::Instant::now();
         let logits2 = loader.forward_real(&config, args.use_flash_attn, &prompt, 0)?;
         println!("DETERMINISM second forward in {:?}", t.elapsed());
-        let a = logits.flatten_all()?.to_vec1::<f32>()?;
-        let b = logits2.flatten_all()?.to_vec1::<f32>()?;
+        let a = logits
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let b = logits2
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         let same = a.len() == b.len()
             && a.iter()
                 .zip(b.iter())
@@ -198,6 +218,7 @@ fn main() -> Result<()> {
                 candle::Device::Cpu,
                 DType::F32,
                 args.offload_budget_bytes,
+                args.gpu_budget_bytes,
             )?
         };
         let mut eager = loader.load_model(&config, args.use_flash_attn)?;
@@ -213,7 +234,7 @@ fn main() -> Result<()> {
     }
 
     let flat = logits.flatten_all()?;
-    let f = flat.to_vec1::<f32>()?;
+    let f = flat.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let finite = f.iter().all(|x| x.is_finite());
     let n_nan = f.iter().filter(|x| x.is_nan()).count();
     let n_inf = f.iter().filter(|x| x.is_infinite()).count();
@@ -232,7 +253,10 @@ fn main() -> Result<()> {
     );
 
     // Top-5 argmax at the last token as a sanity signal.
-    let last = logits.i((0, tokens.len() - 1, ..))?.to_vec1::<f32>()?;
+    let last = logits
+        .i((0, tokens.len() - 1, ..))?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
     let mut idx: Vec<usize> = (0..last.len()).collect();
     idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap());
     let toks: Vec<_> = idx[..5].to_vec();
