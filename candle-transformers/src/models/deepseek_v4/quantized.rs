@@ -17,13 +17,15 @@
 
 use candle::{DType, Device, Error, Result, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
-use candle_nn::{Init, VarBuilder};
+use candle_nn::{rms_norm, Init, Module, VarBuilder};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
 
-use super::{DeepseekV4Config, DeepseekV4ForCausalLM};
+use super::{
+    DeepseekV4Config, DeepseekV4DecoderLayer, DeepseekV4ForCausalLM, DeepseekV4HyperHead,
+};
 use candle::safetensors::MmapedSafetensors;
 
 /// FP8 E4M3 -> f32: sign(1) exp(4) mantissa(3), exponent bias 7.
@@ -377,6 +379,7 @@ struct WeightCache {
     order: VecDeque<String>,
     bytes: usize,
     max_bytes: usize,
+    evictions: usize,
 }
 
 impl WeightCache {
@@ -412,6 +415,7 @@ impl WeightCache {
             };
             if let Some(t) = self.tensors.remove(&oldest) {
                 self.bytes -= t.elem_count() * t.dtype().size_in_bytes();
+                self.evictions += 1;
             }
         }
     }
@@ -422,6 +426,10 @@ impl WeightCache {
 
     fn len(&self) -> usize {
         self.tensors.len()
+    }
+
+    fn evictions(&self) -> usize {
+        self.evictions
     }
 }
 
@@ -685,7 +693,7 @@ impl DeepseekV4Quantized {
     /// on-disk tensor is a packed 1-D byte array, so the logical shape is
     /// required to know `n`/`m` and to reshape.
     pub fn load_weight(&self, name: &str, dims: &[usize]) -> Result<Tensor> {
-        if let Some(t) = self.cache.lock().unwrap().get(name) {
+        if let Some(t) = self.cache.lock().get(name) {
             return Ok(t);
         }
         let t = if self.real_schema {
@@ -693,7 +701,7 @@ impl DeepseekV4Quantized {
         } else {
             self.dequantize(name, dims)?
         };
-        self.cache.lock().unwrap().insert(name, t.clone());
+        self.cache.lock().insert(name, t.clone());
         Ok(t)
     }
 
@@ -736,11 +744,16 @@ impl DeepseekV4Quantized {
 
     /// Resident dequantized bytes and cached-tensor count (for tuning/tests).
     pub fn resident_bytes(&self) -> usize {
-        self.cache.lock().unwrap().resident_bytes()
+        self.cache.lock().resident_bytes()
     }
 
     pub fn cached_len(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        self.cache.lock().len()
+    }
+
+    /// Number of offload-cache evictions since construction (LRU budget drops).
+    pub fn evictions(&self) -> usize {
+        self.cache.lock().evictions()
     }
 
     /// Build the eager [`DeepseekV4ForCausalLM`] from this loader's on-demand
@@ -753,6 +766,79 @@ impl DeepseekV4Quantized {
         let backend = QuantizedBackend { loader: self };
         let vb = VarBuilder::new_with_args(Box::new(backend), self.out_dtype, &self.dev);
         super::DeepseekV4ForCausalLM::new(cfg, use_flash_attn, vb)
+    }
+
+    /// Streaming prefill: build only the shared root weights (embedding, final
+    /// norm, mHC head, lm_head) plus exactly ONE decoder layer at a time, run
+    /// that layer's forward, then drop its GPU tensors before the next layer's
+    /// weights are loaded. This keeps peak VRAM to ~one layer's weights + the
+    /// activations (instead of all 43 layers materialized eagerly), which is
+    /// what lets the ~146 GiB real `DeepSeek-V4-Flash` checkpoint run on a 96 GB
+    /// GPU. All layer types (Sliding / CSA / HCA) and the per-layer DSA
+    /// indexer/compressor state are handled by reusing the same
+    /// [`DeepseekV4DecoderLayer`] the eager forward uses, so semantics match the
+    /// eager path exactly. Returns `[B, S, vocab]` logits.
+    pub fn forward_real(
+        &self,
+        cfg: &DeepseekV4Config,
+        use_flash_attn: bool,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let dev = &self.dev;
+        let out_dtype = self.out_dtype;
+
+        // Shared root weights — resident for the whole forward (small).
+        let root = VarBuilder::new_with_args(
+            Box::new(QuantizedBackend { loader: self }),
+            out_dtype,
+            dev,
+        );
+        let embed_tokens = candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            root.pp("model").pp("embed_tokens"),
+        )?;
+        let norm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            root.pp("model").pp("norm"),
+        )?;
+        let hc_head = DeepseekV4HyperHead::new(cfg, root.pp("model").pp("hc_head"))?;
+
+        let (bs, seq) = input_ids.dims2()?;
+        let emb = embed_tokens.forward(input_ids)?; // [B,S,D]
+        let mut hidden = emb
+            .unsqueeze(2)?
+            .broadcast_as((bs, seq, cfg.hc_mult, cfg.hidden_size))?
+            .contiguous()?; // [B,S,hc_mult,D]
+
+        for i in 0..cfg.num_hidden_layers {
+            let layer_vb = VarBuilder::new_with_args(
+                Box::new(LayerBackend { loader: self, layer: i }),
+                out_dtype,
+                dev,
+            );
+            let mut layer = DeepseekV4DecoderLayer::new(cfg, i, use_flash_attn, layer_vb)?;
+            hidden = layer.forward(&hidden, Some(input_ids), seqlen_offset)?;
+            // Drop this layer's GPU tensors before loading the next layer; the
+            // CPU dequantized weights stay in the size-bounded LRU cache (up to
+            // `max_bytes`, which callers size generously) so revisited/re-loaded
+            // tensors do not need to be re-dequantized or re-read from mmap.
+            drop(layer);
+        }
+
+        let collapsed = hc_head.forward(&hidden)?; // [B,S,D]
+        let out = norm.forward(&collapsed)?;
+
+        let head_vb = VarBuilder::new_with_args(
+            Box::new(QuantizedBackend { loader: self }),
+            out_dtype,
+            dev,
+        );
+        let lm_head =
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, head_vb.pp("lm_head"))?;
+        lm_head.forward(&out)
     }
 }
 
@@ -798,6 +884,58 @@ impl SimpleBackend for QuantizedBackend<'_> {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.loader.contains(name)
+    }
+}
+
+/// Per-layer `SimpleBackend`: serves only `model.layers.<i>.<name>` through the
+/// real loader, so a streaming forward can construct exactly one decoder layer
+/// at a time (its GPU weights are dropped before the next layer is loaded),
+/// keeping peak VRAM to ~one layer + activations instead of all 43 layers.
+struct LayerBackend<'a> {
+    loader: &'a DeepseekV4Quantized,
+    layer: usize,
+}
+
+impl LayerBackend<'_> {
+    fn full_name(&self, name: &str) -> String {
+        format!("model.layers.{}.{}", self.layer, name)
+    }
+}
+
+impl SimpleBackend for LayerBackend<'_> {
+    fn get(&self, s: Shape, name: &str, _h: Init, dtype: DType, dev: &Device) -> Result<Tensor> {
+        let full = self.full_name(name);
+        let dims = s.dims().to_vec();
+        let t = self.loader.load_weight(&full, &dims)?;
+        if t.shape() != &s {
+            return Err(Error::UnexpectedShape {
+                msg: format!("shape mismatch for {full}"),
+                expected: s,
+                got: t.shape().clone(),
+            }
+            .bt());
+        }
+        t.to_device(dev)?.to_dtype(dtype)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        let full = self.full_name(name);
+        let dims = if self.loader.real_schema {
+            match real_schema_target(&full) {
+                Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
+                _ => self.loader.st.get(&full)?.shape().to_vec(),
+            }
+        } else {
+            self.loader.st.get(&full)?.shape().to_vec()
+        };
+        self.loader
+            .load_weight(&full, &dims)?
+            .to_device(dev)?
+            .to_dtype(dtype)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.loader.contains(&self.full_name(name))
     }
 }
 
@@ -1810,7 +1948,10 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!("v4q_real_{}", std::process::id()));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("v4q_real_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let p = dir.join("model.safetensors");
         write_st(&p, &shards);
@@ -1868,4 +2009,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(paths[0].parent().unwrap());
         Ok(())
     }
+
+    /// The per-layer streaming forward (`forward_real`) must produce exactly the
+    /// same logits as the eager `load_model` path (same dequant + same forward,
+    /// one layer at a time). This is the CPU-level guarantee that streaming does
+    /// not change semantics; the GPU run then just changes *where* the weights
+    /// live, not what is computed.
+    #[test]
+    fn deepseek_v4_streaming_forward_matches_eager() -> candle::Result<()> {
+        let cfg = real_synth_config();
+        let dev = Device::Cpu;
+        let paths = write_real_synth_shards(&cfg);
+        let budget = 1 << 28;
+
+        let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?;
+
+        let loader = unsafe {
+            DeepseekV4Quantized::new_real(&paths, dev.clone(), DType::F32, budget)?
+        };
+        // Streaming path: only one layer's weights resident at a time.
+        let logits_stream = loader.forward_real(&cfg, false, &ids, 0)?;
+        assert_eq!(
+            logits_stream.dims(),
+            &[1, 5, cfg.vocab_size],
+            "streaming logits shape"
+        );
+        let flat = logits_stream.flatten_all()?.to_vec1::<f32>()?;
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "streaming logits finite"
+        );
+
+        // Eager path: all layers resident at once.
+        let mut eager = loader.load_model(&cfg, false)?;
+        let logits_eager = eager.forward(&ids, 0)?;
+
+        assert_close(
+            &logits_stream,
+            &logits_eager,
+            0.0,
+            "streaming vs eager identical",
+        );
+
+        // Determinism: a second streaming forward matches bit-for-bit.
+        let logits_stream2 = loader.forward_real(&cfg, false, &ids, 0)?;
+        assert_close(
+            &logits_stream,
+            &logits_stream2,
+            0.0,
+            "streaming deterministic",
+        );
+
+        let _ = std::fs::remove_dir_all(paths[0].parent().unwrap());
+        Ok(())
+    }
+
 }
