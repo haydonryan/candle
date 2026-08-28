@@ -60,6 +60,11 @@ struct Args {
     /// vs the streaming path (streaming-vs-eager cross-check on a fitting model).
     #[arg(long)]
     cross_check: bool,
+
+    /// Dump the flattened F32 logits (shape [seq_len, vocab] after removing the
+    /// batch dim) to a file as raw little-endian f32, for external parity checks.
+    #[arg(long)]
+    dump_logits: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -265,6 +270,22 @@ fn main() -> Result<()> {
         if let Ok(s) = tokenizer.decode(&[t as u32], false) {
             println!("  token {t} -> {s:?}");
         }
+    }
+
+    if let Some(path) = &args.dump_logits {
+        // Logits shape is [1, seq_len, vocab]; drop the batch dim and dump the
+        // raw F32 logits (seq_len * vocab) as little-endian f32.
+        let seq = logits.dim(1)?;
+        let vocab = logits.dim(2)?;
+        let per_pos = seq * vocab;
+        let buf: Vec<u8> = f.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(path, &buf)?;
+        println!(
+            "DUMPED logits to {}: seq_len={seq} vocab={vocab} nf32={} bytes={}",
+            path.display(),
+            per_pos,
+            buf.len()
+        );
     }
 
     Ok(())
