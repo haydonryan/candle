@@ -126,10 +126,8 @@ fn main() -> Result<()> {
     let block = (args.block, args.block);
     // Real deepseek-ai V4-Flash: flat-name schema (embed.weight / attn.* / ffn.* /
     // hc_*) with `.scale` fp8 scales, per-expert FP4 w1/w2/w3, and MTP layers that
-    // candle does not model. `load_quantized_for_causal_lm(.., real_schema = true)`
-    // performs the name remap + FP4 expert assembly.
-    let scale_suffix = ".scale";
-    let fp4_prefixes: Vec<String> = vec!["ffn.experts.".into()];
+    // candle does not model. `load_quantized_for_causal_lm` performs the name
+    // remap + FP4 expert assembly.
 
     let tokens = tokenizer
         .encode(&*args.prompt, true)
@@ -180,11 +178,8 @@ fn main() -> Result<()> {
                 &device,
                 DType::BF16,
                 block,
-                scale_suffix,
-                &fp4_prefixes,
                 args.offload_budget_bytes,
                 args.gpu_budget_bytes,
-                true,
             )?
         };
         let load_time = t0.elapsed();

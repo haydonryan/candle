@@ -360,26 +360,18 @@ fn real_schema_target(name: &str) -> Option<RealTarget> {
 /// `VarBuilder`/[`SimpleBackend`] used to construct the eager
 /// [`DeepseekV4ForCausalLM`].
 ///
-/// Two weight schemas are supported:
-/// - **Synthetic**: fp8 E4M3 weights with ue8m0 block scales at
-///   `weight_block_size = [128, 128]` (scale tensors named `<weight>_scale_inv`)
-///   and stacked fp4 E2M1 expert weights (`experts.gate_up_proj` /
-///   `experts.down_proj`). Used by the small CPU test fixture.
-/// - **Real** (`real_schema = true`): the `deepseek-ai/DeepSeek-V4-Flash`
-///   checkpoint, which uses flat names (`embed.weight`, `layers.N.attn.*`,
-///   `layers.N.ffn.*`, `hc_*`), fp8 E4M3 block-`[128,128]` ue8m0 scales named
-///   `<weight>.scale`, per-expert FP4 E2M1 routed experts
-///   (`ffn.experts.N.w1/w2/w3`) with a per-row `gran_k = 32` ue8m0 block scale
-///   (`[n, m/32]`, I8-packed `[n, m/2]` weight), plain BF16 compressor/gate/
-///   norm/embed/head weights, and MTP layers (which candle does not model).
+/// Only the real `deepseek-ai/DeepSeek-V4-Flash` schema is supported: flat
+/// names (`embed.weight`, `layers.N.attn.*`, `layers.N.ffn.*`, `hc_*`), fp8
+/// E4M3 block-`[128,128]` ue8m0 scales named `<weight>.scale`, per-expert FP4
+/// E2M1 routed experts (`ffn.experts.N.w1/w2/w3`) with a per-row `gran_k = 32`
+/// ue8m0 block scale (`[n, m/32]`, I8-packed `[n, m/2]` weight), plain
+/// BF16 compressor/gate/norm/embed/head weights, and MTP layers (which candle
+/// does not model).
 pub struct DeepseekV4Quantized {
     st: MmapedSafetensors,
     names: HashSet<String>,
     block: (usize, usize),
     fp4_block: (usize, usize),
-    scale_suffix: String,
-    fp4_prefixes: Vec<String>,
-    real_schema: bool,
     dev: Device,
     /// Where dequantized weights are materialized and cached (the offload
     /// cache). Always CPU: keeping weights off the GPU lets the real ~146 GiB
@@ -399,25 +391,18 @@ pub struct DeepseekV4Quantized {
 }
 
 impl DeepseekV4Quantized {
-    /// `block` is the fp8 dequant block and `fp4_block` the fp4 expert dequant
-    /// block (synthetic V4-Flash sample: `(128, 128)` for both).
-    /// `scale_suffix` is appended to a weight name to find its scale tensor
-    /// (synthetic sample: `"_scale_inv"`). `fp4_prefixes` name the expert tensors
-    /// stored as FP4 E2M1 (synthetic sample: `experts.gate_up_proj`/`down_proj`).
-    /// `real_schema` selects the real `deepseek-ai/DeepSeek-V4-Flash` flat-name
-    /// layout (use [`DeepseekV4Quantized::new_real`] for that).
+    /// `block` is the fp8 dequant block (real V4-Flash `(128, 128)`); the FP4
+    /// expert dequant block is fixed at the real per-row `gran_k = 32`
+    /// `(1, 32)` layout. The real `deepseek-ai/DeepSeek-V4-Flash` flat-name
+    /// layout (name remap + per-expert FP4 assembly) is the only supported
+    /// schema.
     ///
     /// # Safety
     ///
     /// The unsafe is inherited from mmap'ing the shard files.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         paths: &[impl AsRef<Path>],
         block: (usize, usize),
-        fp4_block: (usize, usize),
-        scale_suffix: &str,
-        fp4_prefixes: &[String],
-        real_schema: bool,
         dev: Device,
         out_dtype: DType,
         max_bytes: usize,
@@ -429,10 +414,7 @@ impl DeepseekV4Quantized {
             st,
             names,
             block,
-            fp4_block,
-            scale_suffix: scale_suffix.to_string(),
-            fp4_prefixes: fp4_prefixes.to_vec(),
-            real_schema,
+            fp4_block: (1, 32),
             dev,
             cache_dev: Device::Cpu,
             out_dtype,
@@ -458,10 +440,6 @@ impl DeepseekV4Quantized {
         Self::new(
             paths,
             (128, 128),
-            (1, 32),
-            ".scale",
-            &["ffn.experts.".to_string()],
-            true,
             dev,
             out_dtype,
             max_bytes,
@@ -475,11 +453,7 @@ impl DeepseekV4Quantized {
     }
 
     fn is_fp4(&self, name: &str) -> bool {
-        if self.real_schema {
-            name.contains(".ffn.experts.")
-        } else {
-            self.fp4_prefixes.iter().any(|p| name.contains(p.as_str()))
-        }
+        name.contains(".ffn.experts.")
     }
 
     /// Scale tensor name for a real-schema weight: `<basename>.scale`, where
@@ -535,10 +509,6 @@ impl DeepseekV4Quantized {
         Tensor::stack(&rows, 0)
     }
 
-    fn scale_name(&self, name: &str) -> String {
-        format!("{name}{}", self.scale_suffix)
-    }
-
     /// `dims` is the logical (model-requested) shape — for FP4 experts the
     /// on-disk tensor is a packed 1-D byte array, so the logical shape is
     /// required to know `n`/`m` and to reshape.
@@ -546,11 +516,7 @@ impl DeepseekV4Quantized {
         if let Some(t) = self.cache.lock().get(name) {
             return Ok(t);
         }
-        let t = if self.real_schema {
-            self.load_real(name, dims)?
-        } else {
-            self.dequantize(name, dims)?
-        };
+        let t = self.load_real(name, dims)?;
         self.cache.lock().insert(name, t.clone());
         Ok(t)
     }
@@ -575,11 +541,7 @@ impl DeepseekV4Quantized {
         let rows: usize = dims[..rank - 1].iter().product();
         let cols = dims[rank - 1];
         let is_fp4 = self.is_fp4(name);
-        let scale = if self.real_schema {
-            self.real_scale_name(name)
-        } else {
-            self.scale_name(name)
-        };
+        let scale = self.real_scale_name(name);
         let block = if is_fp4 { self.fp4_block } else { self.block };
         let t = if is_fp4 {
             dequantize_fp4_linear(&self.st, name, &scale, rows, cols, block, &self.cache_dev)?
@@ -745,13 +707,9 @@ impl SimpleBackend for QuantizedBackend<'_> {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         // No requested shape (used for plain tensors such as the hash-router's
         // `tid2eid`); fall back to the on-disk shape.
-        let dims = if self.loader.real_schema {
-            match real_schema_target(name) {
-                Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
-                _ => self.loader.st.get(name)?.shape().to_vec(),
-            }
-        } else {
-            self.loader.st.get(name)?.shape().to_vec()
+        let dims = match real_schema_target(name) {
+            Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
+            _ => self.loader.st.get(name)?.shape().to_vec(),
         };
         self.loader.gpu_weight(name, &dims, dev, dtype)
     }
@@ -794,13 +752,9 @@ impl SimpleBackend for LayerBackend<'_> {
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
         let full = self.full_name(name);
-        let dims = if self.loader.real_schema {
-            match real_schema_target(&full) {
-                Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
-                _ => self.loader.st.get(&full)?.shape().to_vec(),
-            }
-        } else {
-            self.loader.st.get(&full)?.shape().to_vec()
+        let dims = match real_schema_target(&full) {
+            Some(RealTarget::Single(real)) => self.loader.st.get(&real)?.shape().to_vec(),
+            _ => self.loader.st.get(&full)?.shape().to_vec(),
         };
         self.loader.gpu_weight(&full, &dims, dev, dtype)
     }
@@ -810,15 +764,12 @@ impl SimpleBackend for LayerBackend<'_> {
     }
 }
 
-/// `block` is the fp8 dequant block (real V4-Flash `(128, 128)`), `fp4_block`
-/// the FP4 expert dequant block (real V4-Flash `(1, 32)`, per-row `gran_k=32`;
-/// synthetic fixtures pass the same block for both), `scale_suffix` the fp8
-/// scale-tensor suffix (`"_scale_inv"` synthetic / `".scale"` real), and
-/// `fp4_prefixes` the expert FP4 weight name prefixes. `real_schema` selects
-/// the real `deepseek-ai/DeepSeek-V4-Flash` flat-name layout (name remap +
-/// per-expert FP4 assembly). `offload_budget_bytes` caps the resident
-/// dequantized weight cache; the rest of the checkpoint stays mmap-backed on
-/// disk.
+/// `block` is the fp8 dequant block (real V4-Flash `(128, 128)`); the FP4
+/// expert dequant block is fixed at the real per-row `gran_k = 32` `(1, 32)`
+/// layout. Only the real `deepseek-ai/DeepSeek-V4-Flash` flat-name schema is
+/// supported (name remap + per-expert FP4 assembly). `offload_budget_bytes`
+/// caps the resident dequantized weight cache; the rest of the checkpoint
+/// stays mmap-backed on disk.
 ///
 /// # Safety
 ///
@@ -831,20 +782,12 @@ pub unsafe fn load_quantized_for_causal_lm(
     dev: &Device,
     out_dtype: DType,
     block: (usize, usize),
-    scale_suffix: &str,
-    fp4_prefixes: &[String],
     offload_budget_bytes: usize,
     gpu_max_bytes: usize,
-    real_schema: bool,
 ) -> Result<DeepseekV4ForCausalLM> {
-    let fp4_block = if real_schema { (1, 32) } else { block };
     let loader = DeepseekV4Quantized::new(
         paths,
         block,
-        fp4_block,
-        scale_suffix,
-        fp4_prefixes,
-        real_schema,
         dev.clone(),
         out_dtype,
         offload_budget_bytes,
@@ -986,36 +929,6 @@ mod tests {
         assert!(dequantize_fp8_block_scale(&w, &[127; 4], 4, 4, (3, 3)).is_err());
         let p = [0x32; 4];
         assert!(dequantize_fp4_block_scale(&p, &[127; 4], 4, 4, (2, 2)).is_err());
-    }
-
-    // ---- Synthetic V4-Flash-shaped fp8/fp4 checkpoint + full-model load ----
-
-    /// V4-Flash-shaped but small enough for CPU: head_dim 512, 64 heads,
-    /// sliding-window attention, fp8 linear weights + fp4 experts.
-    fn synth_config() -> DeepseekV4Config {
-        serde_json::from_str(
-            r#"{
-                "vocab_size": 64, "hidden_size": 16, "moe_intermediate_size": 32,
-                "num_hidden_layers": 2, "num_attention_heads": 64, "num_key_value_heads": 1,
-                "head_dim": 512, "q_lora_rank": 8, "o_lora_rank": 8, "qk_rope_head_dim": 256,
-                "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
-                "num_nextn_predict_layers": 0, "o_groups": 8, "num_hash_layers": 0,
-                "index_head_dim": 4, "index_n_heads": 1, "index_topk": 4, "hc_mult": 2,
-                "hc_sinkhorn_iters": 5, "hc_eps": 1e-6, "partial_rotary_factor": 0.5,
-                "sliding_window": 128, "max_position_embeddings": 256, "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
-                "attention_bias": false, "attention_dropout": 0.0, "mlp_bias": false,
-                "output_router_logits": false, "router_aux_loss_coef": 0.001, "router_jitter_noise": 0.0,
-                "swiglu_limit": 10.0, "initializer_range": 0.02, "use_cache": true,
-                "bos_token_id": 0, "eos_token_id": 1,
-                "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
-                "compress_ratios": [0, 0, 0, 0],
-                "layer_types": ["sliding_attention", "sliding_attention"],
-                "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 16,
-                                 "original_max_position_embeddings": 65536, "type": "yarn"}
-            }"#,
-        )
-        .unwrap()
     }
 
     /// Deterministic pseudo-random f32 values in [-1, 1].
@@ -1166,358 +1079,6 @@ mod tests {
         vals.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// Weight spec for the synthetic checkpoint.
-    enum WKind {
-        Fp8,
-        Fp4,
-        Plain,
-    }
-    struct W {
-        name: String,
-        kind: WKind,
-        shape: Vec<usize>,
-    }
-
-    /// The full V4-Flash-shaped weight plan (matches the eager model's
-    /// `VarBuilder` namespace). `seed` per weight for reproducibility.
-    fn synth_weight_plan(cfg: &DeepseekV4Config) -> Vec<W> {
-        let h = cfg.num_attention_heads;
-        let d = cfg.head_dim;
-        let mut ws = Vec::new();
-        ws.push(W {
-            name: "model.embed_tokens.weight".into(),
-            kind: WKind::Fp8,
-            shape: vec![cfg.vocab_size, cfg.hidden_size],
-        });
-        ws.push(W {
-            name: "lm_head.weight".into(),
-            kind: WKind::Fp8,
-            shape: vec![cfg.vocab_size, cfg.hidden_size],
-        });
-        ws.push(W {
-            name: "model.norm.weight".into(),
-            kind: WKind::Plain,
-            shape: vec![cfg.hidden_size],
-        });
-        let mix = (2 + cfg.hc_mult) * cfg.hc_mult;
-        ws.push(W {
-            name: "model.hc_head.hc_fn".into(),
-            kind: WKind::Plain,
-            shape: vec![cfg.hc_mult, cfg.hc_mult * cfg.hidden_size],
-        });
-        ws.push(W {
-            name: "model.hc_head.hc_base".into(),
-            kind: WKind::Plain,
-            shape: vec![cfg.hc_mult],
-        });
-        ws.push(W {
-            name: "model.hc_head.hc_scale".into(),
-            kind: WKind::Plain,
-            shape: vec![1],
-        });
-        for i in 0..cfg.num_hidden_layers {
-            let p = format!("model.layers.{i}");
-            ws.push(W {
-                name: format!("{p}.self_attn.q_a_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.q_lora_rank, cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.q_a_norm.weight"),
-                kind: WKind::Plain,
-                shape: vec![cfg.q_lora_rank],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.q_b_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![h * d, cfg.q_lora_rank],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.kv_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![d, cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.kv_norm.weight"),
-                kind: WKind::Plain,
-                shape: vec![d],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.o_a_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.o_groups * cfg.o_lora_rank, h * d / cfg.o_groups],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.o_b_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.hidden_size, cfg.o_groups * cfg.o_lora_rank],
-            });
-            ws.push(W {
-                name: format!("{p}.self_attn.sinks"),
-                kind: WKind::Plain,
-                shape: vec![h],
-            });
-            ws.push(W {
-                name: format!("{p}.attn_hc.fn"),
-                kind: WKind::Plain,
-                shape: vec![mix, cfg.hc_mult * cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.attn_hc.base"),
-                kind: WKind::Plain,
-                shape: vec![mix],
-            });
-            ws.push(W {
-                name: format!("{p}.attn_hc.scale"),
-                kind: WKind::Plain,
-                shape: vec![3],
-            });
-            ws.push(W {
-                name: format!("{p}.ffn_hc.fn"),
-                kind: WKind::Plain,
-                shape: vec![mix, cfg.hc_mult * cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.ffn_hc.base"),
-                kind: WKind::Plain,
-                shape: vec![mix],
-            });
-            ws.push(W {
-                name: format!("{p}.ffn_hc.scale"),
-                kind: WKind::Plain,
-                shape: vec![3],
-            });
-            ws.push(W {
-                name: format!("{p}.input_layernorm.weight"),
-                kind: WKind::Plain,
-                shape: vec![cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.post_attention_layernorm.weight"),
-                kind: WKind::Plain,
-                shape: vec![cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.gate.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.n_routed_experts, cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.experts.gate_up_proj"),
-                kind: WKind::Fp4,
-                shape: vec![
-                    cfg.n_routed_experts,
-                    2 * cfg.moe_intermediate_size,
-                    cfg.hidden_size,
-                ],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.experts.down_proj"),
-                kind: WKind::Fp4,
-                shape: vec![
-                    cfg.n_routed_experts,
-                    cfg.hidden_size,
-                    cfg.moe_intermediate_size,
-                ],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.shared_experts.gate_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.moe_intermediate_size, cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.shared_experts.up_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.moe_intermediate_size, cfg.hidden_size],
-            });
-            ws.push(W {
-                name: format!("{p}.mlp.shared_experts.down_proj.weight"),
-                kind: WKind::Fp8,
-                shape: vec![cfg.hidden_size, cfg.moe_intermediate_size],
-            });
-        }
-        ws
-    }
-
-    #[test]
-    fn deepseek_v4_quantized_load_forward_synthetic() -> candle::Result<()> {
-        let cfg = synth_config();
-        let dev = Device::Cpu;
-        let block = (4, 4);
-        let scale_suffix = "_scale_inv";
-        let fp4_prefixes: Vec<String> = vec![
-            "mlp.experts.gate_up_proj".to_string(),
-            "mlp.experts.down_proj".to_string(),
-        ];
-
-        // Build the weight data (quantized on disk + unquantized reference).
-        let plan = synth_weight_plan(&cfg);
-        let mut shard0: Vec<(String, String, Vec<usize>, Vec<u8>)> = Vec::new();
-        let mut shard1: Vec<(String, String, Vec<usize>, Vec<u8>)> = Vec::new();
-        let mut shard2: Vec<(String, String, Vec<usize>, Vec<u8>)> = Vec::new();
-        let mut unquant: HashMap<String, Tensor> = HashMap::new();
-        let seed = 0x1234_5678u64;
-        for (wi, w) in plan.iter().enumerate() {
-            let n_elems: usize = w.shape.iter().product();
-            let vals = lcg(seed.wrapping_add(wi as u64 * 7919), n_elems);
-            let rank = w.shape.len();
-            let (rows, cols) = (w.shape[..rank - 1].iter().product(), w.shape[rank - 1]);
-            let (mut wbytes, mut scale_bytes): (Vec<u8>, Vec<u8>) = match w.kind {
-                WKind::Fp8 => {
-                    let (wb, sb) = quant_fp8(&vals, rows, cols, block);
-                    (wb, sb)
-                }
-                WKind::Fp4 => {
-                    let (wb, sb) = quant_fp4(&vals, rows, cols, block);
-                    (wb, sb)
-                }
-                WKind::Plain => (f32_bytes(&vals), Vec::new()),
-            };
-            unquant.insert(
-                w.name.clone(),
-                Tensor::from_vec(vals, w.shape.clone(), &dev)?,
-            );
-            // Which shard? Root weights + layer 0 -> shard0/1, layer 1 -> shard2.
-            let target = if w.name.starts_with("model.layers.1") {
-                &mut shard2
-            } else if w.name.starts_with("model.layers.0") {
-                &mut shard1
-            } else {
-                &mut shard0
-            };
-            match w.kind {
-                WKind::Fp8 => {
-                    target.push((
-                        w.name.clone(),
-                        "F8_E4M3".to_string(),
-                        w.shape.clone(),
-                        std::mem::take(&mut wbytes),
-                    ));
-                    let gn = rows / block.0 * (cols / block.1);
-                    target.push((
-                        format!("{}{}", w.name, scale_suffix),
-                        "F8_E8M0".to_string(),
-                        vec![gn],
-                        std::mem::take(&mut scale_bytes),
-                    ));
-                }
-                WKind::Fp4 => {
-                    target.push((
-                        w.name.clone(),
-                        "U8".to_string(),
-                        vec![w.shape.iter().product::<usize>() / 2],
-                        std::mem::take(&mut wbytes),
-                    ));
-                    let gn = rows / block.0 * (cols / block.1);
-                    target.push((
-                        format!("{}{}", w.name, scale_suffix),
-                        "F8_E8M0".to_string(),
-                        vec![gn],
-                        std::mem::take(&mut scale_bytes),
-                    ));
-                }
-                WKind::Plain => {
-                    target.push((
-                        w.name.clone(),
-                        "F32".to_string(),
-                        w.shape.clone(),
-                        std::mem::take(&mut wbytes),
-                    ));
-                }
-            }
-        }
-
-        let dir = std::env::temp_dir().join(format!("v4q_synth_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        let p0 = dir.join("model-00001-of-00003.safetensors");
-        let p1 = dir.join("model-00002-of-00003.safetensors");
-        let p2 = dir.join("model-00003-of-00003.safetensors");
-        write_st(&p0, &shard0);
-        write_st(&p1, &shard1);
-        write_st(&p2, &shard2);
-
-        // Tiny offload budget -> the loader must evict while materializing all
-        // weights (proves the size-bounded offload cache is exercised).
-        let budget = 512 * 1024usize; // < total checkpoint size -> evicts while keeping some resident
-        let paths = [p0.as_path(), p1.as_path(), p2.as_path()];
-        let loader = unsafe {
-            DeepseekV4Quantized::new(
-                &paths,
-                block,
-                block,
-                scale_suffix,
-                &fp4_prefixes,
-                false,
-                dev.clone(),
-                DType::F32,
-                budget,
-                budget,
-            )?
-        };
-        // Every weight requested by the model must be present or intentionally
-        // fall back (e_score_correction_bias is absent -> zeros in the model).
-        assert!(loader.contains("model.embed_tokens.weight"));
-        assert!(loader.contains("model.layers.0.mlp.experts.gate_up_proj"));
-        assert!(loader.contains("model.layers.0.self_attn.q_a_proj.weight_scale_inv"));
-
-        let mut model = loader.load_model(&cfg, false)?;
-
-        // The on-demand offload cache was exercised and stayed within budget.
-        assert!(
-            loader.resident_bytes() <= budget,
-            "offload cache over budget"
-        );
-        assert!(loader.cached_len() > 0, "offload cache was never populated");
-
-        let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?;
-        let logits = model.forward(&ids, 0)?;
-        assert_eq!(logits.dims(), &[1, 5, cfg.vocab_size], "logits shape");
-        let flat = logits.flatten_all()?.to_vec1::<f32>()?;
-        assert!(flat.iter().all(|v| v.is_finite()), "logits must be finite");
-
-        // Determinism: a second forward (fresh KV cache) matches exactly.
-        let logits2 = {
-            let mut m = unsafe {
-                load_quantized_for_causal_lm(
-                    &cfg,
-                    false,
-                    &paths,
-                    &dev,
-                    DType::F32,
-                    block,
-                    scale_suffix,
-                    &fp4_prefixes,
-                    budget,
-                    budget,
-                    false,
-                )?
-            };
-            m.forward(&ids, 0)?
-        };
-        assert_close(&logits, &logits2, 0.0, "deterministic");
-
-        // Cross-check against the exact (unquantized) model: the fp8/fp4
-        // pipeline must be close to the full-precision forward.
-        let vb = VarBuilder::from_tensors(unquant, DType::F32, &dev);
-        let mut ref_model = DeepseekV4ForCausalLM::new(&cfg, false, vb)?;
-        let ref_logits = ref_model.forward(&ids, 0)?;
-        assert_eq!(ref_logits.dims(), logits.dims(), "ref shape");
-        let l = logits.flatten_all()?.to_vec1::<f32>()?;
-        let r = ref_logits.flatten_all()?.to_vec1::<f32>()?;
-        let mut max_abs = 0f32;
-        let mut max_rel = 0f32;
-        for (a, b) in l.iter().zip(r.iter()) {
-            max_abs = max_abs.max((a - b).abs());
-            max_rel = max_rel.max((a - b).abs() / (b.abs() + 1e-3));
-        }
-        // 4x4-block fp8/fp4 on random weights: expect a few percent max error.
-        assert!(max_abs < 0.5, "quantized vs full logits max abs {max_abs}");
-        assert!(max_rel < 0.1, "quantized vs full logits max rel {max_rel}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
-    }
-
     // ---- Real-schema (deepseek-ai/DeepSeek-V4-Flash) tests ----
 
     /// Real V4-Flash name remap: candle model weight names -> on-disk flat
@@ -1652,10 +1213,9 @@ mod tests {
     }
 
     /// A real-schema-shaped synthetic checkpoint (flat names) loaded through
-    /// `load_quantized_for_causal_lm(.., real_schema = true)`: exercises the
-    /// name remap, per-expert FP4 w1/w2/w3 assembly into stacked 3-D
-    /// gate_up/down_proj, fp8 block dequant, the hash router's I64 `tid2eid`,
-    /// shared experts and mHC tensors.
+    /// `load_quantized_for_causal_lm`: exercises the name remap, per-expert FP4
+    /// w1/w2/w3 assembly into stacked 3-D gate_up/down_proj, fp8 block dequant,
+    /// the hash router's I64 `tid2eid`, shared experts and mHC tensors.
     fn real_synth_config() -> DeepseekV4Config {
         serde_json::from_str(
             r#"{
@@ -1869,8 +1429,6 @@ mod tests {
 
         let ids = Tensor::new(&[1u32, 3, 7, 2, 5][..], &dev)?.unsqueeze(0)?;
         let block = (128, 128);
-        let scale_suffix = ".scale";
-        let fp4_prefixes: Vec<String> = vec!["ffn.experts.".into()];
         let mut model = unsafe {
             load_quantized_for_causal_lm(
                 &cfg,
@@ -1879,11 +1437,8 @@ mod tests {
                 &dev,
                 DType::F32,
                 block,
-                scale_suffix,
-                &fp4_prefixes,
                 budget,
                 budget,
-                true,
             )?
         };
         let logits = model.forward(&ids, 0)?;
@@ -1903,11 +1458,8 @@ mod tests {
                 &dev,
                 DType::F32,
                 block,
-                scale_suffix,
-                &fp4_prefixes,
                 budget,
                 budget,
-                true,
             )?
         };
         let logits2 = m2.forward(&ids, 0)?;
