@@ -4,10 +4,10 @@
 //! shipped with the tiny sample model) and exposes the V4-specific fields that
 //! `deepseek2` does not carry: `head_dim`, `o_lora_rank`, `o_groups`,
 //! `compress_rates`/`compress_ratios`, `num_hash_layers`, the `index_*` group,
-//! the `hc_*` group, `layer_types`, `num_nextn_predict_layers`,
-//! `partial_rotary_factor` and `topk_method`. It also maps `layer_types` to a
-//! per-layer compression rate and RoPE type (main layers use `rope_theta`,
-//! compressor layers use `compress_rope_theta` with Yarn scaling).
+//! the `hc_*` group, `layer_types`, `partial_rotary_factor`. It also maps
+//! `layer_types` to a per-layer compression rate and RoPE type (main layers
+//! use `rope_theta`, compressor layers use `compress_rope_theta` with Yarn
+//! scaling).
 
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
@@ -83,24 +83,6 @@ pub enum LayerType {
     HeavilyCompressedAttention,
 }
 
-/// Expert selection method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TopkMethod {
-    Greedy,
-    GroupLimitedGreedy,
-    NoauxTc,
-}
-
-/// Router scoring function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScoringFunc {
-    Softmax,
-    #[serde(rename = "sqrtsoftplus")]
-    SqrtSoftplus,
-}
-
 /// RoPE scaling type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,29 +125,15 @@ fn default_tie_word_embeddings() -> bool {
     false
 }
 
-fn default_norm_topk_prob() -> bool {
-    false
-}
-
 fn default_routed_scaling_factor() -> f64 {
     1.0
 }
 
-fn default_topk_method() -> TopkMethod {
-    TopkMethod::Greedy
-}
-
-fn default_scoring_func() -> ScoringFunc {
-    ScoringFunc::Softmax
-}
 fn default_partial_rotary_factor() -> f64 {
     // `qk_rope_head_dim` (64) / `head_dim` (512), as in transformers.
     64.0 / 512.0
 }
 
-fn default_router_aux_loss_coef() -> f64 {
-    0.001
-}
 fn default_fp8_attention() -> bool {
     false
 }
@@ -193,7 +161,6 @@ pub struct DeepseekV4Config {
     pub n_routed_experts: usize,
     pub n_shared_experts: usize,
     pub num_experts_per_tok: usize,
-    pub num_nextn_predict_layers: usize,
     pub o_groups: usize,
     pub num_hash_layers: usize,
     pub index_head_dim: usize,
@@ -209,34 +176,15 @@ pub struct DeepseekV4Config {
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
     pub compress_rope_theta: f32,
-    pub attention_bias: bool,
-    pub attention_dropout: f64,
-    #[serde(default)]
-    pub mlp_bias: bool,
-    #[serde(default = "default_norm_topk_prob")]
-    pub norm_topk_prob: bool,
-    #[serde(default)]
-    pub output_router_logits: bool,
-    #[serde(default = "default_router_aux_loss_coef")]
-    pub router_aux_loss_coef: f64,
-    #[serde(default)]
-    pub router_jitter_noise: f64,
     #[serde(default = "default_routed_scaling_factor")]
     pub routed_scaling_factor: f64,
     pub swiglu_limit: f64,
-    pub initializer_range: f64,
-    #[serde(default = "default_topk_method")]
-    pub topk_method: TopkMethod,
-    #[serde(default = "default_scoring_func")]
-    pub scoring_func: ScoringFunc,
     #[serde(default = "default_hidden_act")]
     pub hidden_act: Activation,
     #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
-    pub use_cache: bool,
     pub bos_token_id: usize,
     pub eos_token_id: usize,
-    pub pad_token_id: Option<usize>,
     #[serde(default = "default_compress_rates")]
     pub compress_rates: CompressRates,
     pub compress_ratios: Vec<usize>,
@@ -2557,15 +2505,12 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 7);
         assert_eq!(cfg.o_lora_rank, 128);
         assert_eq!(cfg.num_hash_layers, 3);
-        assert_eq!(cfg.num_nextn_predict_layers, 1);
         assert_eq!(cfg.partial_rotary_factor, 0.5);
         assert_eq!(cfg.rope_theta, 10_000.0);
         assert_eq!(cfg.compress_rope_theta, 160_000.0);
         assert_eq!(cfg.compress_rates.compressed_sparse_attention, 4);
         assert_eq!(cfg.compress_rates.heavily_compressed_attention, 128);
         assert_eq!(cfg.compress_ratios, vec![0, 0, 4, 128, 4, 128, 4, 0]);
-        assert_eq!(cfg.topk_method, TopkMethod::NoauxTc);
-        assert_eq!(cfg.scoring_func, ScoringFunc::SqrtSoftplus);
         assert_eq!(cfg.rope_scaling.scaling_type, ScaledRopeType::Yarn);
 
     }
@@ -2602,10 +2547,6 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 43);
         assert_eq!(cfg.qk_rope_head_dim, 64);
         assert_eq!(cfg.partial_rotary_factor, 64.0 / 512.0);
-        assert!(!cfg.mlp_bias);
-        assert!(!cfg.output_router_logits);
-        assert_eq!(cfg.router_aux_loss_coef, 0.001);
-        assert_eq!(cfg.router_jitter_noise, 0.0);
         assert_eq!(cfg.compress_rates.compressed_sparse_attention, 4);
         assert_eq!(cfg.compress_rates.heavily_compressed_attention, 128);
 
