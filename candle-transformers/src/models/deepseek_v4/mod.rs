@@ -2081,32 +2081,49 @@ impl DeepseekV4Experts {
     }
 
     /// `hidden_states` is `[N, hidden]`; `top_k_index` and `top_k_weights` are
-    /// `[N, K]`. Non-routed tokens contribute weight 0, matching the reference's
-    /// `index_add_` over only the routed tokens.
+    /// `[N, K]`. Each expert computes only the tokens routed to it and
+    /// `index_add_`s the weighted result back (qwen2_moe / deepseek2 pattern),
+    /// so cost scales with the routed tokens rather than `N * num_experts`.
     pub fn forward(
         &self,
         hidden_states: &Tensor,
         top_k_index: &Tensor,
         top_k_weights: &Tensor,
     ) -> Result<Tensor> {
-        let n = hidden_states.dim(0)?;
-        let k = top_k_index.dim(1)?;
         let dev = hidden_states.device();
-        let dtype = hidden_states.dtype();
+        let weight_dtype = top_k_weights.dtype();
+
+        // Group the routed token rows per expert, alongside their weights.
+        let indices = top_k_index.to_dtype(DType::U32)?.to_vec2::<u32>()?; // [N,K]
+        let weights = top_k_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?; // [N,K]
+        let mut top_x: Vec<Vec<u32>> = vec![Vec::new(); self.num_experts];
+        let mut selected: Vec<Vec<f32>> = vec![Vec::new(); self.num_experts];
+        for (row, (idxs, wts)) in indices.iter().zip(weights.iter()).enumerate() {
+            for (&e, &w) in idxs.iter().zip(wts.iter()) {
+                top_x[e as usize].push(row as u32);
+                selected[e as usize].push(w);
+            }
+        }
+
         let mut out = hidden_states.zeros_like()?;
-        let zero = Tensor::zeros((n, k), dtype, dev)?;
         for i in 0..self.num_experts {
-            let sel = top_k_index.eq(i as u32)?; // [N,K] bool
-            let w = sel.where_cond(top_k_weights, &zero)?;
-            let wsum = w.sum(D::Minus1)?; // [N]
-            let all = self.gate_up_apply(hidden_states, i)?; // [N, 2*inter]
+            let rows = &top_x[i];
+            if rows.is_empty() {
+                continue;
+            }
+            let top_x = Tensor::new(rows.as_slice(), dev)?; // [R]
+            let sel_w = Tensor::new(selected[i].as_slice(), dev)?
+                .reshape(((), 1))?
+                .to_dtype(weight_dtype)?; // [R, 1]
+            let current_state = hidden_states.index_select(&top_x, 0)?; // [R, hidden]
+            let all = self.gate_up_apply(&current_state, i)?; // [R, 2*inter]
             let chunks = all.chunk(2, D::Minus1)?;
             let gate = chunks[0].clamp(f64::NEG_INFINITY, self.limit)?;
             let up = chunks[1].clamp(-self.limit, self.limit)?;
-            let act = (candle_nn::ops::silu(&gate)? * up)?; // [N, inter]
-            let down = self.down_apply(&act, i)?; // [N, hidden]
-            let contrib = down.broadcast_mul(&wsum.unsqueeze(D::Minus1)?)?;
-            out = out.add(&contrib)?;
+            let act = (candle_nn::ops::silu(&gate)? * up)?; // [R, inter]
+            let down = self.down_apply(&act, i)?; // [R, hidden]
+            let contrib = down.broadcast_mul(&sel_w)?; // [R, hidden]
+            out = out.index_add(&top_x, &contrib, 0)?;
         }
         Ok(out)
     }
