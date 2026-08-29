@@ -2441,45 +2441,6 @@ impl DeepseekV4ForCausalLM {
     pub fn clear_kv_cache(&mut self) {
         self.model.clear_kv_cache();
     }
-
-
-    /// Autoregressive generation over the incremental compressed-KV cache.
-    ///
-    /// `prompt` is `[B, S]` (B == 1) of integer token ids. The first
-    /// `forward` prefills the whole prompt at `seqlen_offset = 0`; each later
-    /// step decodes a single token at the running absolute position, so the
-    /// attention/compressor caches grow incrementally (one token per step).
-    /// `sample` receives the last-position `[vocab]` logits and returns the
-    /// next token id (the caller chooses the sampler: ArgMax/TopK/TopP/etc.).
-    /// Returns the generated token ids (excluding the prompt, including the
-    /// EOS token if it is emitted).
-    pub fn generate(
-        &mut self,
-        prompt: &Tensor,
-        max_new_tokens: usize,
-        eos_token_id: usize,
-        mut sample: impl FnMut(&Tensor) -> Result<u32>,
-    ) -> Result<Vec<u32>> {
-        self.clear_kv_cache();
-        let mut pos = 0usize; // absolute position of the first token of `next`
-        let mut next = prompt.clone();
-        let mut out = Vec::with_capacity(max_new_tokens);
-        for _ in 0..max_new_tokens {
-            let logits = self.forward(&next, pos)?; // [1, S, vocab]
-            let last = logits
-                .narrow(D::Minus2, logits.dim(D::Minus2)? - 1, 1)?
-                .squeeze(0)?
-                .squeeze(0)?; // [vocab]
-            let tok = sample(&last)?;
-            out.push(tok);
-            if tok as usize == eos_token_id {
-                break;
-            }
-            pos += next.dim(D::Minus1)?;
-            next = Tensor::new(&[tok], prompt.device())?.unsqueeze(0)?;
-        }
-        Ok(out)
-    }
 }
 
 #[cfg(test)]
@@ -3878,7 +3839,7 @@ mod tests {
     /// Flash-vs-eager per-step decode parity for the DSA kernel, running the
     /// full `DeepseekV4Attention` with the **incremental** compressed-KV cache:
     /// at each step a single new token (`Sq = 1`) is fed at absolute position
-    /// `step`, exactly as the `DeepseekV4ForCausalLM::generate` loop decodes,
+    /// `step`, exactly as an autoregressive decode loop feeds the model,
     /// and the flash output must match eager at every step for all three layer
     /// types (sliding, CSA, HCA). This is the acceptance test for decode-mode
     /// DSA flash driven by the incremental cache + blockmask/block-sparse
@@ -4604,14 +4565,28 @@ mod tests {
         let eos = 1u32;
         let max_new = 5usize;
 
-        // Public `generate()` with an ArgMax sampler over last-position logits.
-        let tokens = model.generate(&prompt, max_new, eos as usize, |logits| {
-            let t = logits
+        // Incremental-cache greedy decode (the loop other models' callers run).
+        model.clear_kv_cache();
+        let mut tokens = Vec::new();
+        let mut pos = 0usize;
+        let mut next = prompt.clone();
+        for _ in 0..max_new {
+            let logits = model.forward(&next, pos)?; // [1, S, vocab]
+            let last = logits
+                .narrow(D::Minus2, logits.dim(D::Minus2)? - 1, 1)?
+                .squeeze(0)?
+                .squeeze(0)?; // [vocab]
+            let t = last
                 .argmax(D::Minus1)?
                 .to_dtype(DType::U32)?
                 .to_vec0::<u32>()?;
-            Ok(t)
-        })?;
+            tokens.push(t);
+            if t == eos {
+                break;
+            }
+            pos += next.dim(D::Minus1)?;
+            next = Tensor::new(&[t], &dev)?.unsqueeze(0)?;
+        }
 
         // Independent reference greedy decode (stateless full-history recompute).
         let mut caches: Vec<Option<Tensor>> = vec![None; cfg.num_hidden_layers];

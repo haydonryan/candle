@@ -9,7 +9,7 @@ use clap::Parser;
 
 use candle_transformers::models::deepseek_v4::{DeepseekV4Config, DeepseekV4ForCausalLM};
 
-use candle::{DType, Tensor};
+use candle::{D, DType, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -147,22 +147,37 @@ fn main() -> Result<()> {
     let repeat_last_n = args.repeat_last_n;
     let eos = config.eos_token_id;
 
-    let generated = model.generate(&prompt, args.sample_len, eos, |logits| {
+    // Autoregressive decode over the incremental compressed-KV cache: the first
+    // forward prefills the prompt at seqlen_offset 0, then one token per step.
+    model.clear_kv_cache();
+    let mut generated = Vec::with_capacity(args.sample_len);
+    let mut pos = 0usize;
+    let mut next = prompt;
+    for _ in 0..args.sample_len {
+        let logits = model.forward(&next, pos)?; // [1, S, vocab]
+        let last = logits
+            .narrow(D::Minus2, logits.dim(D::Minus2)? - 1, 1)?
+            .squeeze(0)?
+            .squeeze(0)?; // [vocab]
         let logits = if repeat_penalty == 1. {
-            logits.clone()
+            last
         } else {
             let start_at = all.len().saturating_sub(repeat_last_n);
             candle_transformers::utils::apply_repeat_penalty(
-                logits,
+                &last,
                 repeat_penalty,
                 &all[start_at..],
             )?
         };
         let tok = logits_processor.sample(&logits)?;
         all.push(tok);
-        Ok(tok)
-    })?;
-
+        generated.push(tok);
+        if tok as usize == eos {
+            break;
+        }
+        pos += next.dim(D::Minus1)?;
+        next = Tensor::new(&[tok], &device)?.unsqueeze(0)?;
+    }
     for &t in generated.iter() {
         if let Some(t) = tokenizer.next_token(t)? {
             print!("{t}");
