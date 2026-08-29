@@ -2992,41 +2992,6 @@ impl DeepseekV4Model {
         self.norm.forward(&collapsed)
     }
 
-    /// Batched continuous-batching decode through the whole stack: `input_ids`
-    /// is `[B, 1]` (one new token per sequence) and `positions[B]` are the
-    /// per-sequence absolute positions. Per-layer KV and compression state lives
-    /// in `kv_cache` (a `DeepseekV4PagedKvCache` shared by all layers), and the
-    /// varlen/paged DSA flash kernel attends the whole batch in one call per
-    /// layer. Returns hidden states `[B, 1, D]`.
-    pub fn decode_batch(
-        &mut self,
-        input_ids: &Tensor,
-        positions: &[usize],
-        kv_cache: &mut DeepseekV4PagedKvCache,
-    ) -> Result<Tensor> {
-        let (bs, seq) = input_ids.dims2()?;
-        if seq != 1 {
-            candle::bail!("decode_batch is a single-token-per-sequence step (got seq {seq})");
-        }
-        if positions.len() != bs {
-            candle::bail!("decode_batch: {} positions for batch {bs}", positions.len());
-        }
-        let emb = self.embed_tokens.forward(input_ids)?; // [B,1,D]
-        let hidden = emb
-            .unsqueeze(2)?
-            .broadcast_as((bs, seq, self.hc_mult, self.hidden_size))?
-            .contiguous()?; // [B,1,H,D]
-        let mut hidden = hidden;
-        let page_block_size = kv_cache.page_block_size();
-        for (li, layer) in self.layers.iter_mut().enumerate() {
-            let layer_cache = kv_cache.layer_mut(li);
-            hidden =
-                layer.forward_paged_decode(&hidden, positions, layer_cache, page_block_size)?;
-        }
-        let collapsed = self.hc_head.forward(&hidden)?; // [B,1,D]
-        self.norm.forward(&collapsed)
-    }
-
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
@@ -3057,23 +3022,6 @@ impl DeepseekV4ForCausalLM {
         self.model.clear_kv_cache();
     }
 
-    /// Batched continuous-batching decode entry point: `input_ids` is `[B, 1]`
-    /// (one new token per sequence), `positions[B]` are the per-sequence
-    /// absolute positions, and `kv_cache` holds the paged per-layer KV /
-    /// compression state shared across steps. Each call decodes one token for
-    /// every sequence through the model's varlen/paged DSA flash kernel and
-    /// returns logits `[B, 1, vocab]`. Sequences may have different histories
-    /// (varlen) and different positions, which is the serving-style batched
-    /// continuous-batching decode this API exists for.
-    pub fn decode_batch(
-        &mut self,
-        input_ids: &Tensor,
-        positions: &[usize],
-        kv_cache: &mut DeepseekV4PagedKvCache,
-    ) -> Result<Tensor> {
-        let hidden = self.model.decode_batch(input_ids, positions, kv_cache)?;
-        self.lm_head.forward(&hidden)
-    }
 
     /// Autoregressive generation over the incremental compressed-KV cache.
     ///
