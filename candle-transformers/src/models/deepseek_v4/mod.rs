@@ -946,7 +946,6 @@ impl DeepseekV4Attention {
         &mut self,
         xs: &Tensor,
         seqlen_offset: usize,
-        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
         let num_heads = self.cfg.num_attention_heads;
@@ -1006,27 +1005,18 @@ impl DeepseekV4Attention {
         // `0` attend / `-inf` pad) is folded into the local sliding columns so
         // batched padded prompts stay correct for both eager and flash paths.
         let (k, v, mask) = match &mut self.compressor {
-            None => {
-                let mut mask = self.sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?;
-                if let Some(ext) = attention_mask {
-                    mask = mask.broadcast_add(ext)?;
-                }
-                (k, v, mask)
-            }
-            Some(comp) => {
-                let (compressed_kv, block_bias) = comp.forward(xs, &q_residual, seqlen_offset)?;
-                let k = Tensor::cat(&[k.clone(), compressed_kv.clone()], 2)?;
-                let v = Tensor::cat(&[v, compressed_kv], 2)?;
-                let sliding = self
-                    .sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?
-                    .broadcast_as((bs, 1, seq_len, kv_len))?;
-                let sliding = match attention_mask {
-                    Some(ext) => sliding.broadcast_add(ext)?,
-                    None => sliding,
-                };
-                let mask = Tensor::cat(&[sliding, block_bias], 3)?;
-                (k, v, mask)
-            }
+            None => self.sliding_kv_mask(&k, &v, seq_len, kv_len, prev_len, xs.device())?,
+            Some(_) => self.compressed_kv_mask(
+                xs,
+                &q_residual,
+                seqlen_offset,
+                &k,
+                &v,
+                seq_len,
+                kv_len,
+                prev_len,
+                bs,
+            )?,
         };
 
         let kv_len = k.dim(2)?;
@@ -1087,6 +1077,49 @@ impl DeepseekV4Attention {
         let grouped = self.o_a_apply(&grouped)?;
         let grouped = grouped.reshape((bs, seq_len, self.cfg.o_groups * self.cfg.o_lora_rank))?;
         self.o_b_apply(&grouped)
+    }
+
+    /// Sliding-window (non-compressor) layer: the additive mask is just the
+    /// local causal sliding window over the KV prefix.
+    fn sliding_kv_mask(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        seq_len: usize,
+        kv_len: usize,
+        prev_len: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let mask = self.sliding_window_mask(seq_len, kv_len, prev_len, device)?;
+        Ok((k.clone(), v.clone(), mask))
+    }
+
+    /// Compressed (CSA/HCA) layer: append the long-range compressed KV and
+    /// extend the additive mask with the compressor's block_bias over the suffix.
+    fn compressed_kv_mask(
+        &mut self,
+        xs: &Tensor,
+        q_residual: &Tensor,
+        seqlen_offset: usize,
+        k: &Tensor,
+        v: &Tensor,
+        seq_len: usize,
+        kv_len: usize,
+        prev_len: usize,
+        bs: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (compressed_kv, block_bias) = self
+            .compressor
+            .as_mut()
+            .unwrap()
+            .forward(xs, q_residual, seqlen_offset)?;
+        let k = Tensor::cat(&[k.clone(), compressed_kv.clone()], 2)?;
+        let v = Tensor::cat(&[v, &compressed_kv], 2)?;
+        let sliding = self
+            .sliding_window_mask(seq_len, kv_len, prev_len, xs.device())?
+            .broadcast_as((bs, 1, seq_len, kv_len))?;
+        let mask = Tensor::cat(&[sliding, block_bias], 3)?;
+        Ok((k, v, mask))
     }
 }
 
@@ -2330,7 +2363,7 @@ impl DeepseekV4DecoderLayer {
         let dtype = hidden_states.dtype();
         let (post, comb, collapsed) = self.attn_hc.forward(hidden_states)?;
         let normed = self.input_layernorm.forward(&collapsed)?;
-        let attn_output = self.self_attn.forward(&normed, seqlen_offset, None)?;
+        let attn_output = self.self_attn.forward(&normed, seqlen_offset)?;
         let hidden_states = post
             .to_dtype(dtype)?
             .unsqueeze(D::Minus1)?
@@ -3287,63 +3320,13 @@ mod tests {
         let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let x = det_tensor(&[1, 5, cfg.hidden_size], 51.0);
-        let out = attn.forward(&x, 0, None)?;
+        let out = attn.forward(&x, 0)?;
         let ref_out = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0, None)?;
         assert_close(&out, &ref_out, 1e-4, "csa-attn");
         Ok(())
     }
 
     /// External/padding attention mask folded into the combined
-    /// [sliding | block_bias] mask for a batched CSA layer: a `-inf` at a local
-    /// sliding position must suppress that column, while the compressed
-    /// block_bias columns are unaffected. Verified against the eager reference
-    /// that applies the same external mask to the sliding part.
-    #[test]
-    fn csa_external_mask_combined_with_block_bias() -> candle::Result<()> {
-        let cfg = csa_attention_config();
-        let dev = Device::Cpu;
-        let attn_w = parity_weights(&cfg);
-        let csa_w = csa_parity_weights(&cfg);
-        let x = det_tensor(&[1, 5, cfg.hidden_size], 91.0);
-
-        // All-attend external mask is a no-op: identical to no mask.
-        let zeros = Tensor::zeros((1, 1, 5, 5), DType::F32, &dev)?;
-        let out_none = {
-            let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
-            DeepseekV4Attention::new(&cfg, 0, false, vb)?.forward(&x, 0, None)?
-        };
-        let out_zero = {
-            let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
-            DeepseekV4Attention::new(&cfg, 0, false, vb)?.forward(&x, 0, Some(&zeros))?
-        };
-        assert_close(&out_none, &out_zero, 1e-6, "ext-zero-noop");
-
-        // Masking the first in-window sliding position (query 3 -> KV 1) must
-        // change the output and match the reference that folds the same mask in.
-        let mut m = vec![0.0f32; 5 * 5];
-        m[3 * 5 + 1] = f32::NEG_INFINITY;
-        let ext = Tensor::from_vec(m, (1, 1, 5, 5), &dev)?;
-        let vb = VarBuilder::from_tensors(merged_weights(&attn_w, &csa_w), DType::F32, &dev);
-        let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
-        let out_masked = attn.forward(&x, 0, Some(&ext))?;
-        let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
-        let ref_masked = reference_csa_attention(&cfg, &emb, &attn_w, &csa_w, &x, 0, Some(&ext))?;
-        assert_close(&out_masked, &ref_masked, 1e-4, "ext-masked");
-        // And masking must actually perturb the output vs the unmasked case.
-        let flat_a = out_none.flatten_all()?.to_vec1::<f32>()?;
-        let flat_b = out_masked.flatten_all()?.to_vec1::<f32>()?;
-        let diff: f32 = flat_a
-            .iter()
-            .zip(flat_b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            diff > 1e-3,
-            "external mask had no effect on output (max diff {diff})"
-        );
-        Ok(())
-    }
-
     /// Merge the attention and compressor sub-namespace weight maps into the
     /// single `compressor.*`-prefixed map `DeepseekV4Attention::new` expects.
     fn merged_weights(
@@ -3390,19 +3373,19 @@ mod tests {
         let mut cache: Option<Tensor> = None;
 
         let x1 = det_tensor(&[1, 5, cfg.hidden_size], 11.0);
-        let o1 = attn.forward(&x1, 0, None)?;
+        let o1 = attn.forward(&x1, 0)?;
         let r1 = reference_forward(&cfg, &emb, &weights, &x1, 0, &mut cache)?;
         assert_close(&o1, &r1, 1e-4, "step1");
 
         // Step 2: a two-token continuation after the cache has been trimmed.
         let x2 = det_tensor(&[1, 2, cfg.hidden_size], 13.0);
-        let o2 = attn.forward(&x2, 5, None)?;
+        let o2 = attn.forward(&x2, 5)?;
         let r2 = reference_forward(&cfg, &emb, &weights, &x2, 5, &mut cache)?;
         assert_close(&o2, &r2, 1e-4, "step2");
 
         // Step 3: single-token generation off the sliding cache.
         let x3 = det_tensor(&[1, 1, cfg.hidden_size], 17.0);
-        let o3 = attn.forward(&x3, 7, None)?;
+        let o3 = attn.forward(&x3, 7)?;
         let r3 = reference_forward(&cfg, &emb, &weights, &x3, 7, &mut cache)?;
         assert_close(&o3, &r3, 1e-4, "step3");
         Ok(())
@@ -3596,7 +3579,7 @@ mod tests {
         let mut attn = DeepseekV4Attention::new(&cfg, 0, false, vb)?;
         let emb = DeepseekV4RotaryEmbedding::new(&cfg, &dev)?;
         let x = det_tensor(&[1, 5, cfg.hidden_size], 81.0);
-        let out = attn.forward(&x, 0, None)?;
+        let out = attn.forward(&x, 0)?;
         let ref_out = reference_hca_attention(&cfg, &emb, &attn_w, &hca_w, &x, 0)?;
         assert_close(&out, &ref_out, 1e-4, "hca-attn");
         Ok(())
@@ -3641,8 +3624,8 @@ mod tests {
             for step in 0..n_steps {
                 let x = det_tensor(&[1, 1, cfg.hidden_size], (51 + step) as f32)
                     .to_dtype(DType::F32)?;
-                let e = bf16.forward(&x, step, None)?.to_dtype(DType::F32)?;
-                let f = fp8.forward(&x, step, None)?.to_dtype(DType::F32)?;
+                let e = bf16.forward(&x, step)?.to_dtype(DType::F32)?;
+                let f = fp8.forward(&x, step)?.to_dtype(DType::F32)?;
                 assert_close(
                     &e,
                     &f,
@@ -3763,7 +3746,7 @@ mod tests {
             let x = det_tensor(&[1, 1, cfg.hidden_size], (51 + step) as f32)
                 .to_device(&dev)?
                 .to_dtype(DType::BF16)?;
-            let _ = bf16.forward(&x, step, None)?;
+            let _ = bf16.forward(&x, step)?;
         }
         let t_bf16 = t0.elapsed().as_secs_f64();
 
@@ -3772,7 +3755,7 @@ mod tests {
             let x = det_tensor(&[1, 1, cfg.hidden_size], (51 + step) as f32)
                 .to_device(&dev)?
                 .to_dtype(DType::BF16)?;
-            let _ = fp8.forward(&x, step, None)?;
+            let _ = fp8.forward(&x, step)?;
         }
         let t_fp8 = t0.elapsed().as_secs_f64();
 
