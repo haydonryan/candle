@@ -33,7 +33,6 @@ use candle::{DType, Error, Result, Storage, Tensor};
 use cudarc::cublaslt::{result, sys};
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
-use crate::models::quantized_deepseek_v4::{fp4_e2m1_to_f32, fp8_e4m3_to_f32};
 
 const WORKSPACE_BYTES: usize = 32 << 20;
 
@@ -292,7 +291,7 @@ fn wrap_f32(slice: cudarc::driver::CudaSlice<f32>, dev: CudaDevice, m: usize, n:
 ///
 /// `act_fp8` is a `(M, K)` fp8 tensor (already scaled so its values are the
 /// actual activations), `w8` is the `(N, K)` fp8 weight with the ue8m0 scale
-/// already folded in (see [`fold_fp8_block_scale`]/[`fp4_to_fp8`]). `alpha`
+/// already folded in. `alpha`
 /// carries any residual activation scale. Returns `(M, N)` in `out_dtype`
 /// (fp32 accumulation, downcast on exit).
 pub fn fp8_matmul(
@@ -459,66 +458,6 @@ pub fn fp8_grouped_linear(
     y.reshape(out_dims)
 }
 
-/// Fold a `[bn, bk]` ue8m0 block scale into a raw fp8 weight, exactly.
-///
-/// `w8` is the `(n, k)` fp8 e4m3 weight, `scale` is the `(n/bn, k/bk)` ue8m0
-/// scale. Because ue8m0 is a power of two, `w8 * scale` only shifts the fp8
-/// exponent — the result is exactly representable in fp8. Out-of-range values
-/// are clamped to the fp8 max (448.0).
-pub fn fold_fp8_block_scale(
-    w8: &[u8],
-    scale: &[u8],
-    n: usize,
-    k: usize,
-    bn: usize,
-    bk: usize,
-) -> Vec<u8> {
-    debug_assert_eq!(w8.len(), n * k);
-    debug_assert_eq!(scale.len(), (n / bn) * (k / bk));
-    let mut out = Vec::with_capacity(n * k);
-    for i in 0..n {
-        let srow = &scale[(i / bn) * (k / bk)..((i / bn) + 1) * (k / bk)];
-        for j in 0..k {
-            let shift = srow[j / bk] as i32 - 127; // ue8m0 exponent delta
-            let b = w8[i * k + j];
-            let sign = b & 0x80;
-            let exp = ((b >> 3) & 0x0F) as i32;
-            let man = b & 0x07;
-            // fp8 e4m3: value = (-1)^s * 2^(exp-7) * (1 + man/8) (or subnormal).
-            // Multiply by 2^shift => exp += shift.
-            let nexp = exp + shift;
-            let nb = sign | ((nexp.clamp(0, 14) as u8) << 3) | man;
-            out.push(nb);
-        }
-    }
-    out
-}
-
-/// Convert a packed fp4 e2m1 weight with a per-row `gran_k=32` ue8m0 scale to
-/// fp8, losslessly.
-///
-/// `wpack` is the `(n, k/2)` packed fp4 weight (low nibble = even k), `scale`
-/// is the `(n, k/32)` ue8m0 vec32 scale. `fp4 * scale` is exactly representable
-/// in fp8 e4m3 (fp8 has more mantissa bits than fp4; scale is a power of two).
-pub fn fp4_to_fp8(wpack: &[u8], scale: &[u8], n: usize, k: usize) -> Vec<u8> {
-    debug_assert_eq!(wpack.len(), n * k / 2);
-    debug_assert_eq!(scale.len(), n * (k / 32));
-    let mut out = Vec::with_capacity(n * k);
-    for i in 0..n {
-        for j in 0..k {
-            let nib = if j % 2 == 0 {
-                wpack[i * k / 2 + j / 2] & 0x0F
-            } else {
-                wpack[i * k / 2 + j / 2] >> 4
-            };
-            let sc = scale[i * (k / 32) + j / 32] as i32 - 127;
-            let v = fp4_e2m1_to_f32(nib) * 2f32.powi(sc);
-            out.push(f32_to_fp8(v));
-        }
-    }
-    out
-}
-
 /// Quantize f32 values to fp8 e4m3 bytes (nearest, with a per-tensor scale).
 /// Returns `(bytes, scale)` such that `value ≈ fp8(bytes) * scale`.
 pub fn quantize_fp8(vals: &[f32]) -> (Vec<u8>, f32) {
@@ -540,7 +479,7 @@ pub fn quantize_fp8(vals: &[f32]) -> (Vec<u8>, f32) {
 /// slice's max magnitude maps into `(224, 448]`), shared across all `m` rows.
 /// Because ue8m0 is a power of two, `v * 2^s` only shifts the fp8 exponent —
 /// the scale is folded directly into the fp8 value (exact, like the weight
-/// folding in [`fold_fp8_block_scale`]). The GEMM then splits the reduction by
+/// folding in. The GEMM then splits the reduction by
 /// slice and carries each slice's scale in a scalar `alpha` (see
 /// [`fp8_linear`]), which is exactly what the scalar-scaled cuBLASLt fp8x8
 /// kernels accept.
@@ -652,199 +591,7 @@ pub fn f32_to_fp8(v: f32) -> u8 {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::models::quantized_deepseek_v4::{fp4_e2m1_to_f32, fp8_e4m3_to_f32};
     use candle::{Device, Tensor};
-
-    fn encode_ue8m0(v: f32) -> u8 {
-        if v == 0.0 {
-            return 0;
-        }
-        let e = v.abs().log2().round() as i32;
-        (e.clamp(-126, 126) + 127) as u8
-    }
-
-    fn encode_fp4(v: f32) -> u8 {
-        let mut best = 0u8;
-        let mut best_d = f32::INFINITY;
-        for nib in 0u8..16 {
-            let x = fp4_e2m1_to_f32(nib);
-            if x.is_nan() {
-                continue;
-            }
-            let d = (v - x).abs();
-            if d < best_d {
-                best_d = d;
-                best = nib;
-            }
-        }
-        best
-    }
-
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
-    }
-
-    fn rel_err(a: &[f32], b: &[f32]) -> f32 {
-        let denom = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
-        max_abs_diff(a, b) / denom
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn fp8_block_gemm_ref(
-        act: &[f32],
-        m: usize,
-        k: usize,
-        w: &[u8],
-        n: usize,
-        scale_f32: &[f32],
-        bn: usize,
-        bk: usize,
-    ) -> Vec<f32> {
-        let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    let s = scale_f32[(j / bn) * (k / bk) + (kk / bk)];
-                    acc += act[i * k + kk] * (fp8_e4m3_to_f32(w[j * k + kk]) * s);
-                }
-                out[i * n + j] = acc;
-            }
-        }
-        out
-    }
-
-    fn fp4_block_gemm_ref(
-        act: &[f32],
-        m: usize,
-        k: usize,
-        wpack: &[u8],
-        n: usize,
-        scale_f32: &[f32],
-    ) -> Vec<f32> {
-        let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    let s = scale_f32[j * (k / 32) + (kk / 32)];
-                    let nib = if kk % 2 == 0 {
-                        wpack[j * k / 2 + kk / 2] & 0x0F
-                    } else {
-                        wpack[j * k / 2 + kk / 2] >> 4
-                    };
-                    acc += act[i * k + kk] * (fp4_e2m1_to_f32(nib) * s);
-                }
-                out[i * n + j] = acc;
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn test_fp8_attention_parity() {
-        let dev = match Device::cuda_if_available(0) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let stream = dev.as_cuda_device().unwrap().cuda_stream();
-        let mut blas = BlasLt::new(stream).unwrap();
-
-        let (m, k, n) = (64usize, 512usize, 512usize);
-        let bn = 128usize;
-        let bk = 128usize;
-        // Activations and fp8 weights in fp32, block-scaled.
-        let act: Vec<f32> = (0..m * k)
-            .map(|i| ((i as f32 * 7919.0) % 200.0 - 100.0) / 100.0)
-            .collect();
-        let wf: Vec<f32> = (0..n * k)
-            .map(|i| ((i as f32 * 104729.0) % 400.0 - 200.0) / 400.0)
-            .collect();
-        let w8: Vec<u8> = wf.iter().map(|&v| f32_to_fp8(v)).collect();
-        let scale_f32: Vec<f32> = (0..(n / bn) * (k / bk))
-            .map(|i| 0.25 * 2f32.powi((i % 5) as i32))
-            .collect();
-        let scale_ue: Vec<u8> = scale_f32.iter().map(|&v| encode_ue8m0(v)).collect();
-
-        // Fold scale into fp8 weight (exact), quantize act to fp8.
-        let w_folded = fold_fp8_block_scale(&w8, &scale_ue, n, k, bn, bk);
-        let (act8, act_scale) = quantize_fp8(&act);
-        // fp8 reference: same fp8-quantized activation, dequant fp8 * block scale, in fp32
-        // (isolates the exact weight-fold path from the fp8 activation-quantization noise).
-        let act_f: Vec<f32> = act8
-            .iter()
-            .map(|&b| fp8_e4m3_to_f32(b) / act_scale)
-            .collect();
-        let ref_out = fp8_block_gemm_ref(&act_f, m, k, &w8, n, &scale_f32, bn, bk);
-
-        let act_t = Tensor::from_vec(act8, (m, k), &dev).unwrap();
-        let w_t = Tensor::from_vec(w_folded, (n, k), &dev).unwrap();
-        let got = fp8_matmul(&mut blas, &act_t, &w_t, 1.0 / act_scale, DType::F32).unwrap();
-        let got_v: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
-
-        println!(
-            "fp8 attention rel_err={} max_diff={}",
-            rel_err(&got_v, &ref_out),
-            max_abs_diff(&got_v, &ref_out)
-        );
-        assert!(rel_err(&got_v, &ref_out) < 5e-2, "fp8 parity failed");
-    }
-
-    #[test]
-    fn test_fp4_moe_parity() {
-        let dev = match Device::cuda_if_available(0) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let stream = dev.as_cuda_device().unwrap().cuda_stream();
-        let mut blas = BlasLt::new(stream).unwrap();
-
-        let (m, k, n) = (64usize, 512usize, 256usize);
-        let act: Vec<f32> = (0..m * k)
-            .map(|i| ((i as f32 * 7919.0) % 200.0 - 100.0) / 100.0)
-            .collect();
-        let wf: Vec<f32> = (0..n * k)
-            .map(|i| ((i as f32 * 104729.0) % 200.0 - 100.0) / 200.0)
-            .collect();
-        let mut wpack = vec![0u8; n * k / 2];
-        for j in 0..n {
-            for kk in 0..k {
-                let nib = encode_fp4(wf[j * k + kk]);
-                if kk % 2 == 0 {
-                    wpack[j * k / 2 + kk / 2] |= nib;
-                } else {
-                    wpack[j * k / 2 + kk / 2] |= nib << 4;
-                }
-            }
-        }
-        let scale_f32: Vec<f32> = (0..n * (k / 32))
-            .map(|i| 0.25 * 2f32.powi((i % 5) as i32))
-            .collect();
-        let scale_ue: Vec<u8> = scale_f32.iter().map(|&v| encode_ue8m0(v)).collect();
-
-        let w_fp8 = fp4_to_fp8(&wpack, &scale_ue, n, k);
-        let (act8, act_scale) = quantize_fp8(&act);
-        let act_f: Vec<f32> = act8
-            .iter()
-            .map(|&b| fp8_e4m3_to_f32(b) / act_scale)
-            .collect();
-        let ref_out = fp4_block_gemm_ref(&act_f, m, k, &wpack, n, &scale_f32);
-
-        let act_t = Tensor::from_vec(act8, (m, k), &dev).unwrap();
-        let w_t = Tensor::from_vec(w_fp8, (n, k), &dev).unwrap();
-        let got = fp8_matmul(&mut blas, &act_t, &w_t, 1.0 / act_scale, DType::F32).unwrap();
-        let got_v: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
-
-        println!(
-            "fp4 MoE rel_err={} max_diff={}",
-            rel_err(&got_v, &ref_out),
-            max_abs_diff(&got_v, &ref_out)
-        );
-        assert!(rel_err(&got_v, &ref_out) < 5e-2, "fp4 parity failed");
-    }
 
     #[test]
     fn benchmark_fp8_vs_bf16() {

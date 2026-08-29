@@ -9,7 +9,6 @@
 //! per-layer compression rate and RoPE type (main layers use `rope_theta`,
 //! compressor layers use `compress_rope_theta` with Yarn scaling).
 
-use super::deepseek2::{BincountOp, TopKLastDimOp};
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
@@ -261,18 +260,6 @@ pub struct DeepseekV4Config {
     pub fp8_compute: bool,
 }
 
-/// Per-layer derived configuration.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayerConfig {
-    pub layer_type: LayerType,
-    /// Compression rate for this layer's attention; `0` for sliding-attention layers.
-    pub compress_rate: usize,
-    /// RoPE base theta for this layer.
-    pub rope_theta: f32,
-    /// Whether Yarn RoPE scaling applies (compressor layers).
-    pub use_yarn: bool,
-}
-
 impl DeepseekV4Config {
     /// Compression rate associated with a given layer type.
     pub fn compress_rate_for(&self, layer_type: LayerType) -> usize {
@@ -283,29 +270,6 @@ impl DeepseekV4Config {
                 self.compress_rates.heavily_compressed_attention
             }
         }
-    }
-
-    /// Derive per-layer compression rate and RoPE type.
-    ///
-    /// Compressor layers (CSA/HCA) use `compress_rope_theta` (e.g. 160000) with
-    /// Yarn scaling; plain sliding-attention layers use `rope_theta` (e.g. 10000).
-    pub fn layer_configs(&self) -> Vec<LayerConfig> {
-        self.effective_layer_types()
-            .iter()
-            .map(|&layer_type| {
-                let compress = layer_type != LayerType::SlidingAttention;
-                LayerConfig {
-                    layer_type,
-                    compress_rate: self.compress_rate_for(layer_type),
-                    rope_theta: if compress {
-                        self.compress_rope_theta
-                    } else {
-                        self.rope_theta
-                    },
-                    use_yarn: compress,
-                }
-            })
-            .collect()
     }
 
     /// Resolve the per-layer attention schedule, deriving it from the legacy
@@ -326,7 +290,6 @@ impl DeepseekV4Config {
             .collect()
     }
 }
-
 /// Unweighted RMS normalization, matching DeepSeek-V4 `UnweightedRMSNorm`:
 /// `x * rsqrt(mean(x^2) + eps)`. The norm factor is computed in f32 and the
 /// multiplication is performed in the input's dtype (as in the reference).
@@ -2333,73 +2296,6 @@ impl DeepseekV4SparseMoeBlock {
     }
 }
 
-/// Auxiliary load-balancing loss (Switch Transformer), matching
-/// `load_balancing_loss_func` in `modeling_deepseek_v4.py`. `gate_logits` are
-/// the per-layer router logits (`[N, num_experts]`); `attention_mask` is the
-/// flat per-token mask (weights padding tokens to zero).
-pub fn load_balancing_loss(
-    gate_logits: &[Tensor],
-    num_experts: usize,
-    top_k: usize,
-    attention_mask: Option<&Tensor>,
-) -> Result<Tensor> {
-    if gate_logits.is_empty() {
-        return Tensor::zeros(1, DType::F32, &Device::Cpu);
-    }
-    let mut tokens_per_expert_sum = vec![0.0f32; num_experts];
-    let mut router_prob_sum = vec![0.0f32; num_experts];
-    let mut total_rows = 0.0f32;
-    let flat_mask: Option<Vec<f32>> = match attention_mask {
-        Some(m) => Some(m.flatten_all()?.to_vec1::<f32>()?),
-        None => None,
-    };
-    for layer_gate in gate_logits {
-        let rw = candle_nn::ops::softmax_last_dim(layer_gate)?.to_dtype(DType::F32)?;
-        let n = rw.dim(0)?;
-        match &flat_mask {
-            None => {
-                let counts = rw
-                    .topk_unsorted(top_k)?
-                    .indices
-                    .flatten_all()?
-                    .bincount(num_experts as u32)?;
-                for (i, c) in counts.iter().enumerate() {
-                    tokens_per_expert_sum[i] += *c as f32;
-                }
-                let col = rw.sum_keepdim(0)?.flatten_all()?;
-                let col = col.to_vec1::<f32>()?;
-                for (i, s) in col.iter().enumerate() {
-                    router_prob_sum[i] += s;
-                }
-                total_rows += n as f32;
-            }
-            Some(mask) => {
-                let sel = rw.topk_unsorted(top_k)?.indices.flatten_all()?;
-                let sel = sel.to_vec1::<u32>()?;
-                for (pos, &e) in sel.iter().enumerate() {
-                    tokens_per_expert_sum[e as usize] += mask[pos / top_k];
-                }
-                let mask_t = Tensor::from_vec(mask.clone(), n, &Device::Cpu)?;
-                let col = rw
-                    .broadcast_mul(&mask_t.unsqueeze(1)?)?
-                    .sum_keepdim(0)?
-                    .flatten_all()?;
-                let col = col.to_vec1::<f32>()?;
-                for (i, s) in col.iter().enumerate() {
-                    router_prob_sum[i] += s;
-                }
-                total_rows += mask.iter().sum::<f32>();
-            }
-        }
-    }
-    let total = total_rows.max(1e-9);
-    let mut overall = 0.0f32;
-    for i in 0..num_experts {
-        overall += (tokens_per_expert_sum[i] / total) * (router_prob_sum[i] / total);
-    }
-    Tensor::new(overall * num_experts as f32, &Device::Cpu)
-}
-
 /// One V4 decoder block (paper §2): an mHC hyper-connection around each of the
 /// attention and MoE sublayers, with the `hc_mult` residual streams kept in
 /// shape `[B, S, hc_mult, D]` throughout.
@@ -2653,22 +2549,6 @@ mod tests {
         assert_eq!(cfg.scoring_func, ScoringFunc::SqrtSoftplus);
         assert_eq!(cfg.rope_scaling.scaling_type, ScaledRopeType::Yarn);
 
-        // Per-layer derivation: main layers use theta=10000, compressors use
-        // theta=160000 (Yarn) with their per-type compression rate.
-        let layers = cfg.layer_configs();
-        assert_eq!(layers.len(), 7);
-        assert_eq!(layers[0].layer_type, LayerType::SlidingAttention);
-        assert_eq!(layers[0].compress_rate, 0);
-        assert_eq!(layers[0].rope_theta, 10_000.0);
-        assert!(!layers[0].use_yarn);
-        assert_eq!(layers[2].layer_type, LayerType::CompressedSparseAttention);
-        assert_eq!(layers[2].compress_rate, 4);
-        assert_eq!(layers[2].rope_theta, 160_000.0);
-        assert!(layers[2].use_yarn);
-        assert_eq!(layers[3].layer_type, LayerType::HeavilyCompressedAttention);
-        assert_eq!(layers[3].compress_rate, 128);
-        assert_eq!(layers[3].rope_theta, 160_000.0);
-        assert!(layers[3].use_yarn);
     }
 
     /// The real deepseek-ai DeepSeek-V4-Flash `config.json` ships neither
@@ -2720,13 +2600,6 @@ mod tests {
         // 44 compress_ratios vs 43 layers: the trailing `0` (index 43) is truncated,
         // so the final kept layer (index 42, ratio 4) is a CSA compressor.
         assert_eq!(lt[42], LayerType::CompressedSparseAttention);
-
-        let layers = cfg.layer_configs();
-        assert_eq!(layers.len(), 43);
-        assert_eq!(layers[0].layer_type, LayerType::SlidingAttention);
-        assert_eq!(layers[3].layer_type, LayerType::HeavilyCompressedAttention);
-        assert_eq!(layers[3].compress_rate, 128);
-        assert!(layers[3].use_yarn);
     }
 
     /// Small self-contained config for op unit tests: head_dim=8,
@@ -4950,65 +4823,6 @@ mod tests {
         let ref_out = ref_moe_parity(&cfg, &weights, &x, Some(&ids), 0)?;
         assert_eq!(out.dims(), ref_out.dims(), "moe-hash shape");
         assert_close(&out, &ref_out, 1e-4, "moe-hash");
-        Ok(())
-    }
-
-    /// Independent reference for the auxiliary load-balancing loss (no mask).
-    fn ref_load_balancing(logits: &[Tensor], e: usize, top_k: usize) -> f32 {
-        let mut tps = vec![0.0f32; e];
-        let mut rps = vec![0.0f32; e];
-        let mut total = 0.0f32;
-        for lg in logits {
-            let rw = candle_nn::ops::softmax_last_dim(lg)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap();
-            let (n, ne) = rw.dims2().unwrap();
-            assert_eq!(ne, e);
-            let counts = rw
-                .topk_unsorted(top_k)
-                .unwrap()
-                .indices
-                .flatten_all()
-                .unwrap()
-                .bincount(e as u32)
-                .unwrap();
-            for (i, c) in counts.iter().enumerate() {
-                tps[i] += *c as f32;
-            }
-            let col = rw.sum_keepdim(0).unwrap().flatten_all().unwrap();
-            let col = col.to_vec1::<f32>().unwrap();
-            for (i, s) in col.iter().enumerate() {
-                rps[i] += s;
-            }
-            total += n as f32;
-        }
-        let mut overall = 0.0;
-        for i in 0..e {
-            overall += (tps[i] / total) * (rps[i] / total);
-        }
-        overall * e as f32
-    }
-
-    #[test]
-    fn moe_aux_loss_matches_reference() -> candle::Result<()> {
-        let cfg = moe_parity_config();
-        let weights = moe_parity_weights(&cfg);
-        let x = det_tensor(&[2, 3, cfg.hidden_size], 95.0);
-        let flat = x.reshape(((), cfg.hidden_size))?;
-        let logits = flat.matmul(&weights["mlp.gate.weight"].t()?)?;
-        let l = load_balancing_loss(
-            std::slice::from_ref(&logits),
-            cfg.n_routed_experts,
-            cfg.num_experts_per_tok,
-            None,
-        )?;
-        let expected = ref_load_balancing(&[logits], cfg.n_routed_experts, cfg.num_experts_per_tok);
-        let got: f32 = l.to_scalar()?;
-        assert!(
-            (got - expected).abs() < 1e-4,
-            "aux loss got {got}, expected {expected}"
-        );
         Ok(())
     }
 
