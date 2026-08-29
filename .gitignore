@@ -46,6 +46,8 @@ out.safetensors
 out.wav
 bria.mp3
 bria.safetensors
+bria.wav
+bench_results/
 
 # DeepSeek-V4 tiny sample weights (downloaded separately; the parity harness
 # applies convert_weights.py when present, and its cargo test skips without them)
@@ -53,6 +55,3 @@ sample_models/**/model.safetensors
 sample_models/**/model.safetensors.index.json
 sample_models/**/tokenizer.json
 sample_models/**/generation_config.json
-
-# Agent tooling only (just test / just check); not part of the upstream feature.
-justfile
