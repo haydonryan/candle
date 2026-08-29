@@ -51,6 +51,12 @@ struct Args {
     #[arg(long)]
     streaming: bool,
 
+    /// Run the fp8/fp4 mixed-precision compute path: fp8 attention projections +
+    /// routed MoE experts on the fp8 tensor cores (cuBLASLt), keeping weights
+    /// fp8 with per-block/group ue8m0 activation scaling.
+    #[arg(long)]
+    fp8_compute: bool,
+
     /// Run the forward a second time and report whether logits are bit-identical
     /// (determinism check).
     #[arg(long)]
@@ -71,10 +77,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let dir = args.model_dir;
-    let config: DeepseekV4Config = {
+    let mut config: DeepseekV4Config = {
         let config_file = dir.join("config.json");
         serde_json::from_slice(&std::fs::read(config_file)?)?
     };
+    if args.fp8_compute {
+        config.fp8_compute = true;
+        println!("fp8_compute enabled: attention + routed MoE experts run on fp8 tensor cores");
+    }
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(E::msg)?;
 
     let device = candle_examples::device(false)?; // GPU (cuda) unless forced cpu by candle_examples

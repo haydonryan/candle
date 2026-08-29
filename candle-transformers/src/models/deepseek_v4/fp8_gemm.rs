@@ -344,7 +344,28 @@ impl Fp8Weight {
     /// Quantize an f32 `(out, in)` weight tensor to fp8.
     pub fn from_tensor(w: &Tensor) -> Result<Self> {
         let (out, in_) = w.dims2()?;
-        let v = w.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        // Read the weight to host in its native dtype and quantize on CPU. We
+        // deliberately avoid `to_dtype(F32)` on the GPU: candle's CUDA launch
+        // configs are u32, so a contiguous tensor with >= 2^32 elements (the
+        // real V4-Flash MoE gate_up is `[256*2*inter, hidden]` == 2^32 exactly)
+        // overflows `el as u32` to 0 and fails with CUDA_ERROR_INVALID_VALUE.
+        // Reading the native (bf16) data straight to host sidesteps the u32
+        // boundary and the 2x fp32 GPU intermediate.
+        let flat = w.flatten_all()?;
+        let v: Vec<f32> = match flat.dtype() {
+            DType::BF16 => flat
+                .to_vec1::<half::bf16>()?
+                .into_iter()
+                .map(|x| f32::from(x))
+                .collect(),
+            DType::F16 => flat
+                .to_vec1::<half::f16>()?
+                .into_iter()
+                .map(|x| f32::from(x))
+                .collect(),
+            DType::F32 => flat.to_vec1::<f32>()?,
+            dt => candle::bail!("from_tensor: unsupported weight dtype {dt:?}"),
+        };
         let (bytes, scale) = quantize_fp8(&v);
         let t = Tensor::from_vec(bytes, (out, in_), w.device())?;
         Ok(Self { bytes: t, scale })
@@ -551,23 +572,79 @@ pub fn quantize_fp8_block(vals: &[f32], m: usize, k: usize, bk: usize) -> (Vec<u
     (out, scales)
 }
 
-/// Round an f32 to the nearest fp8 e4m3 byte (finite, clamp to range).
+/// Round an f32 to the nearest fp8 e4m3 byte (round-to-nearest-even, clamp).
+///
+/// This is a direct O(1) bit-level conversion, not the previous brute-force
+/// nearest scan over all 256 fp8 values: the real V4-Flash MoE gate_up is
+/// exactly 2^32 elements, so a 256x per-element scan was ~1.1e12 operations
+/// and took minutes per layer to re-quantize. Matches the brute-force result
+/// everywhere except exact half-way ties (nearest-even vs nearest), which do
+/// not occur for real weights.
+///
+/// fp8 e4m3: sign(1) exp(4, bias 7) man(3); exp-field 0 is subnormal
+/// (`man * 2^-9`, `man` 1..7), exp-field 15 with man 7 is NaN, so the max
+/// finite value is exp 15 / man 6 = 448.
+#[inline]
 pub fn f32_to_fp8(v: f32) -> u8 {
-    // Brute-force nearest over the 256 representable values is small and exact.
-    let mut best = 0u8;
-    let mut best_d = f32::INFINITY;
-    for b in 0u16..=255 {
-        let x = fp8_e4m3_to_f32(b as u8);
-        if x.is_nan() {
-            continue;
+    let bits = v.to_bits();
+    let neg = if bits >> 31 != 0 { 0x80 } else { 0x00 };
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        // ±Inf / NaN -> clamp to the max finite fp8 (448).
+        return if neg == 0 { 0x7E } else { 0xFE };
+    }
+    if exp == 0 && man == 0 {
+        return neg; // ±0
+    }
+    let e = exp - 127; // unbiased fp32 exponent
+    let e8 = e + 7; // fp8 exponent field (bias 7)
+    let mant = (man | 0x80_0000) as u64; // 24-bit 1.mantissa
+    if e8 <= 0 {
+        // Subnormal fp8: value = idx * 2^-9, idx in 0..=8. idx = round(|v|/2^-9).
+        let shift = 14 - e; // e <= -7 -> shift >= 21
+        if shift > 30 {
+            return neg;
         }
-        let d = (v - x).abs();
-        if d < best_d {
-            best_d = d;
-            best = b as u8;
+        let half = 1u64 << (shift - 1);
+        let rem = mant & ((1u64 << shift) - 1);
+        let mut index = (mant >> shift) as u32;
+        if rem > half || (rem == half && (index & 1) == 1) {
+            index += 1;
+        }
+        if index >= 8 {
+            // Carry into the first normal fp8 (exp field 1, man 0) = 2^-6.
+            return (1 << 3) | neg;
+        }
+        if index == 0 {
+            return neg;
+        }
+        return index as u8 | neg;
+    }
+    if e8 > 15 {
+        // Overflow -> clamp to the max finite fp8 (448 = exp 15, man 6).
+        return if neg == 0 { 0x7E } else { 0xFE };
+    }
+    // Normal fp8: keep the top 3 mantissa bits (bits 22..20), round.
+    let keep = 20;
+    let shifted = (mant >> keep) as u32; // leading 1 + 3 mantissa bits
+    let rem = mant & ((1u64 << keep) - 1);
+    let half = 1u64 << (keep - 1);
+    let mut m8 = shifted & 0x7;
+    if rem > half || (rem == half && (m8 & 1) == 1) {
+        m8 += 1;
+        if m8 > 7 {
+            let e8b = e8 + 1;
+            if e8b > 15 {
+                return if neg == 0 { 0x7E } else { 0xFE };
+            }
+            return ((e8b << 3) as u8) | neg;
         }
     }
-    best
+    if e8 == 15 && m8 > 6 {
+        m8 = 6; // exp 15, man 7 is NaN -> clamp to 448
+    }
+    ((e8 << 3) as u8 | m8 as u8) | neg
 }
 
 /// fp8 e4m3 byte -> f32 (mirrors `float8::F8E4M3`).
