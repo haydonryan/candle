@@ -692,7 +692,6 @@ impl DeepseekV4Quantized {
             .contiguous()?; // [B,S,hc_mult,D]
 
         for i in 0..cfg.num_hidden_layers {
-            let t_layer = std::time::Instant::now();
             let layer_vb = VarBuilder::new_with_args(
                 Box::new(LayerBackend {
                     loader: self,
@@ -702,21 +701,7 @@ impl DeepseekV4Quantized {
                 dev,
             );
             let mut layer = DeepseekV4DecoderLayer::new(cfg, i, use_flash_attn, layer_vb)?;
-            let t_load = std::time::Instant::now();
             hidden = layer.forward(&hidden, Some(input_ids), seqlen_offset)?;
-            let t_fwd = std::time::Instant::now();
-            eprintln!(
-                "  layer {i}/{} load={:?} fwd={:?} resident={} cached={} evict={} gpu={} gpu_cached={} gpu_evict={}",
-                cfg.num_hidden_layers - 1,
-                t_load.duration_since(t_layer),
-                t_fwd.duration_since(t_load),
-                self.resident_bytes(),
-                self.cached_len(),
-                self.evictions(),
-                self.gpu_resident_bytes(),
-                self.gpu_cached_len(),
-                self.gpu_evictions()
-            );
             // Layer GPU weights are kept in the size-bounded GPU LRU
             // (`gpu_cache`, up to `gpu_max_bytes`) so recently used layers stay
             // resident on the GPU instead of being re-transferred on reuse;
