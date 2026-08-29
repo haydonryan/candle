@@ -82,34 +82,35 @@ pub fn fp4_e2m1_to_f32(nib: u8) -> f32 {
 /// one per `block` (`bn` x `bm`) tile. Every element is scaled by its tile's
 /// scale: `out[i*m+j] = fp8(weight[i*m+j]) * e8m0(scale[i/bn*(m/bm)+j/bm])`.
 /// Tiles must divide the weight shape evenly (checkpoints pad to 128).
-pub fn dequantize_fp8_block_scale(
-    weight: &[u8],
-    scale: &[u8],
+/// Shared block-scale dequant driver: validates the `n x m` / `block`
+/// tiling and `scale` layout, precomputes the per-tile E8M0 scales, and runs
+/// the row-parallel per-element loop, calling `decode(idx)` for the raw
+/// byte -> f32 value at absolute index `idx`. Rows are independent, so this is
+/// parallelized across them (this dominates the ~146 GiB real checkpoint).
+fn dequantize_block_scale(
     n: usize,
     m: usize,
     block: (usize, usize),
+    scale: &[u8],
+    decode: impl Fn(usize) -> f32 + Sync,
 ) -> Result<Vec<f32>> {
     let (bn, bm) = block;
     let gn = n / bn;
     let gm = m / bm;
     if bn == 0 || bm == 0 || gn == 0 || gm == 0 || !n.is_multiple_of(bn) || !m.is_multiple_of(bm) {
-        candle::bail!("fp8 block {block:?} does not tile weight {n}x{m}");
-    }
-    if weight.len() != n * m {
-        candle::bail!("fp8 weight len {} != {n}*{m}", weight.len());
+        candle::bail!("block {block:?} does not tile weight {n}x{m}");
     }
     if scale.len() != gn * gm {
         candle::bail!(
-            "fp8 scale len {} != ({n}/{bn})*({m}/{bm}) = {}",
+            "scale len {} != ({n}/{bn})*({m}/{bm}) = {}",
             scale.len(),
             gn * gm
         );
     }
     // Precompute every tile's scale once (ue8m0 decode is `2^(b-127)`), so the
-    // hot per-element loop is just decode * scale. Rows are independent, so
-    // parallelize across them (this dominates the 146 GiB real checkpoint).
+    // hot per-element loop is just decode * scale.
     let scales: Vec<f32> = scale.iter().map(|&b| e8m0_to_f32(b)).collect();
-    let out: Vec<f32> = (0..n)
+    Ok((0..n)
         .into_par_iter()
         .flat_map(|i| {
             let srow = (i / bn) * gm;
@@ -117,13 +118,27 @@ pub fn dequantize_fp8_block_scale(
             for jb in 0..gm {
                 let sc = scales[srow + jb];
                 for j in jb * bm..(jb + 1) * bm {
-                    row.push(fp8_e4m3_to_f32(weight[i * m + j]) * sc);
+                    row.push(decode(i * m + j) * sc);
                 }
             }
             row
         })
-        .collect();
-    Ok(out)
+        .collect())
+}
+
+/// Dequantize a block-scaled FP8 E4M3 weight into f32 values. `scale` is one
+/// E8M0 byte per `block` tile.
+pub fn dequantize_fp8_block_scale(
+    weight: &[u8],
+    scale: &[u8],
+    n: usize,
+    m: usize,
+    block: (usize, usize),
+) -> Result<Vec<f32>> {
+    if weight.len() != n * m {
+        candle::bail!("fp8 weight len {} != {n}*{m}", weight.len());
+    }
+    dequantize_block_scale(n, m, block, scale, |idx| fp8_e4m3_to_f32(weight[idx]))
 }
 
 /// Dequantize a block-scaled FP4 E2M1 weight into f32 values.
@@ -138,48 +153,18 @@ pub fn dequantize_fp4_block_scale(
     m: usize,
     block: (usize, usize),
 ) -> Result<Vec<f32>> {
-    let (bn, bm) = block;
-    let gn = n / bn;
-    let gm = m / bm;
-    if bn == 0 || bm == 0 || gn == 0 || gm == 0 || !n.is_multiple_of(bn) || !m.is_multiple_of(bm) {
-        candle::bail!("fp4 block {block:?} does not tile weight {n}x{m}");
-    }
     if packed.len() != n * m / 2 {
         candle::bail!("fp4 packed len {} != {n}*{m}/2", packed.len());
     }
-    if scale.len() != gn * gm {
-        candle::bail!(
-            "fp4 scale len {} != ({n}/{bn})*({m}/{bm}) = {}",
-            scale.len(),
-            gn * gm
-        );
-    }
-    // Precompute every tile's scale once (ue8m0 decode is `2^(b-127)`), so the
-    // hot per-element loop is just nibble decode * scale. Rows are independent,
-    // so parallelize across them (this dominates the 146 GiB real checkpoint).
-    let scales: Vec<f32> = scale.iter().map(|&b| e8m0_to_f32(b)).collect();
-    let out: Vec<f32> = (0..n)
-        .into_par_iter()
-        .flat_map(|i| {
-            let srow = (i / bn) * gm;
-            let mut row = Vec::with_capacity(m);
-            for jb in 0..gm {
-                let sc = scales[srow + jb];
-                for j in jb * bm..(jb + 1) * bm {
-                    let idx = i * m + j;
-                    let byte = packed[idx / 2];
-                    let nib = if idx.is_multiple_of(2) {
-                        byte & 0x0F
-                    } else {
-                        (byte >> 4) & 0x0F
-                    };
-                    row.push(fp4_e2m1_to_f32(nib) * sc);
-                }
-            }
-            row
-        })
-        .collect();
-    Ok(out)
+    dequantize_block_scale(n, m, block, scale, |idx| {
+        let byte = packed[idx / 2];
+        let nib = if idx.is_multiple_of(2) {
+            byte & 0x0F
+        } else {
+            (byte >> 4) & 0x0F
+        };
+        fp4_e2m1_to_f32(nib)
+    })
 }
 
 /// Load a block-scaled FP8 linear weight from mmap-backed shards and
