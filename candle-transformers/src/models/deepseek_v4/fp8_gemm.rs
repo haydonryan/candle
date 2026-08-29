@@ -33,6 +33,7 @@ use candle::{DType, Error, Result, Storage, Tensor};
 use cudarc::cublaslt::{result, sys};
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut};
 use std::sync::Arc;
+use crate::models::quantized_deepseek_v4::{fp4_e2m1_to_f32, fp8_e4m3_to_f32};
 
 const WORKSPACE_BYTES: usize = 32 << 20;
 
@@ -647,44 +648,11 @@ pub fn f32_to_fp8(v: f32) -> u8 {
     ((e8 << 3) as u8 | m8 as u8) | neg
 }
 
-/// fp8 e4m3 byte -> f32 (mirrors `float8::F8E4M3`).
-#[inline]
-pub fn fp8_e4m3_to_f32(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exp = (b >> 3) & 0x0F;
-    let man = (b & 0x07) as f32;
-    if exp == 0 {
-        return sign * man * 2f32.powi(-9);
-    }
-    if b & 0x7F == 0x7F {
-        return f32::NAN;
-    }
-    sign * (1.0 + man / 8.0) * 2f32.powi(exp as i32 - 7)
-}
-
-/// fp4 e2m1 nibble -> f32 (sign 1, exp 2, mantissa 1, bias 1).
-#[inline]
-pub fn fp4_e2m1_to_f32(nib: u8) -> f32 {
-    let sign = if nib & 0x8 != 0 { -1.0 } else { 1.0 };
-    let exp = (nib >> 1) & 0x3;
-    let man = (nib & 0x1) as f32;
-    let abs = match exp {
-        0 => man * 0.5,
-        3 => {
-            if man == 0.0 {
-                f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        e => (1.0 + man / 2.0) * 2f32.powi(e as i32 - 1),
-    };
-    sign * abs
-}
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::models::quantized_deepseek_v4::{fp4_e2m1_to_f32, fp8_e4m3_to_f32};
     use candle::{Device, Tensor};
 
     fn encode_ue8m0(v: f32) -> u8 {
