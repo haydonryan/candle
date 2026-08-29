@@ -88,6 +88,7 @@ pub mod phi3;
 pub mod pixtral;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
+pub mod quantized_deepseek_v4;
 pub mod quantized_gemma3;
 pub mod quantized_glm4;
 pub mod quantized_lfm2;

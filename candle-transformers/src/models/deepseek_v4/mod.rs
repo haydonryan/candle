@@ -17,8 +17,6 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 pub mod fp8_gemm;
-/// DeepSeek-V4 fp8/fp4 quantized weight loading + CPU/disk offload.
-pub mod quantized;
 
 /// Shared cuBLASLt handle used for the fp8-compute path (fp8 x fp8 GEMM with
 /// fp32 accumulation). Wrapped in `RefCell` so it can be borrowed mutably from

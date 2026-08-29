@@ -23,7 +23,9 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use super::{DeepseekV4Config, DeepseekV4DecoderLayer, DeepseekV4ForCausalLM, DeepseekV4HyperHead};
+use crate::models::deepseek_v4::{
+    DeepseekV4Config, DeepseekV4DecoderLayer, DeepseekV4ForCausalLM, DeepseekV4HyperHead,
+};
 use candle::safetensors::MmapedSafetensors;
 
 /// FP8 E4M3 -> f32: sign(1) exp(4) mantissa(3), exponent bias 7.
@@ -808,7 +810,7 @@ impl DeepseekV4Quantized {
     ) -> Result<DeepseekV4ForCausalLM> {
         let backend = QuantizedBackend { loader: self };
         let vb = VarBuilder::new_with_args(Box::new(backend), self.out_dtype, &self.dev);
-        super::DeepseekV4ForCausalLM::new(cfg, use_flash_attn, vb)
+        DeepseekV4ForCausalLM::new(cfg, use_flash_attn, vb)
     }
 
     /// Streaming prefill: build only the shared root weights (embedding, final
@@ -1033,6 +1035,7 @@ pub unsafe fn load_quantized_for_causal_lm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::deepseek_v4::{DeepseekV4Config, DeepseekV4ForCausalLM};
 
     fn close(a: f32, b: f32, tol: f32, label: &str) {
         let ok = (a.is_nan() && b.is_nan())
