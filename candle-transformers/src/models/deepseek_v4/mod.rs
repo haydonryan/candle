@@ -11,6 +11,7 @@
 
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
+use crate::serde_default_fn;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -117,34 +118,16 @@ pub struct RopeScaling {
     pub scaling_type: ScaledRopeType,
 }
 
-fn default_hidden_act() -> Activation {
-    Activation::Silu
-}
-
-fn default_tie_word_embeddings() -> bool {
-    false
-}
-
-fn default_routed_scaling_factor() -> f64 {
-    1.0
-}
-
-fn default_partial_rotary_factor() -> f64 {
-    // `qk_rope_head_dim` (64) / `head_dim` (512), as in transformers.
-    64.0 / 512.0
-}
-
-fn default_fp8_attention() -> bool {
-    false
-}
-
-fn default_compress_rates() -> CompressRates {
-    CompressRates {
-        compressed_sparse_attention: 4,
-        heavily_compressed_attention: 128,
-    }
-}
-
+serde_default_fn!(Activation, default_hidden_act, Activation::Silu);
+serde_default_fn!(bool, default_tie_word_embeddings, false);
+serde_default_fn!(f64, default_routed_scaling_factor, 1.0);
+// `qk_rope_head_dim` (64) / `head_dim` (512), as in transformers.
+serde_default_fn!(f64, default_partial_rotary_factor, 64.0 / 512.0);
+serde_default_fn!(bool, default_fp8_attention, false);
+serde_default_fn!(CompressRates, default_compress_rates, CompressRates {
+    compressed_sparse_attention: 4,
+    heavily_compressed_attention: 128,
+});
 /// DeepSeek-V4 configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepseekV4Config {
