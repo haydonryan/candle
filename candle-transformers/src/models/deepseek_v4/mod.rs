@@ -1171,9 +1171,48 @@ pub struct CsaCompressionState {
     overlap_gate: Option<Tensor>,
 }
 
-impl Default for CsaCompressionState {
-    fn default() -> Self {
-        Self::new()
+/// Shared window-aligned buffer+peel logic for the CSA and HCA compressors:
+/// concatenate new `(kv, gate)` projections with the buffered remainder, peel
+/// off the longest window-aligned prefix, keep the leftover buffered, and
+/// return `(chunk_kv, chunk_gate, first_window_position)`.
+fn store_compression_entries(
+    buffer_kv: &mut Option<Tensor>,
+    buffer_gate: &mut Option<Tensor>,
+    entry_count: usize,
+    kv: &Tensor,
+    gate: &Tensor,
+    compress_rate: usize,
+) -> Result<(Tensor, Tensor, usize)> {
+    let first_window_position = entry_count * compress_rate;
+    let (kv, gate) = match (buffer_kv.as_ref(), buffer_gate.as_ref()) {
+        (Some(bk), Some(bg)) => (Tensor::cat(&[bk, kv], 1)?, Tensor::cat(&[bg, gate], 1)?),
+        _ => (kv.clone(), gate.clone()),
+    };
+    let len = kv.dim(1)?;
+    let usable = (len / compress_rate) * compress_rate;
+    let rem = len - usable;
+    if rem > 0 {
+        *buffer_kv = Some(kv.narrow(1, usable, rem)?);
+        *buffer_gate = Some(gate.narrow(1, usable, rem)?);
+    } else {
+        *buffer_kv = None;
+        *buffer_gate = None;
+    }
+    let chunk_kv = kv.narrow(1, 0, usable)?;
+    let chunk_gate = gate.narrow(1, 0, usable)?;
+    Ok((chunk_kv, chunk_gate, first_window_position))
+}
+
+/// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
+fn running_compressed_kv(
+    compressed_kv: &Option<Tensor>,
+    device: &Device,
+    head_dim: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    match compressed_kv {
+        Some(c) => Ok(c.clone()),
+        None => Tensor::zeros((1, 0, head_dim), dtype, device),
     }
 }
 
@@ -1191,10 +1230,7 @@ impl CsaCompressionState {
 
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
     fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
-        match &self.compressed_kv {
-            Some(c) => Ok(c.clone()),
-            None => Tensor::zeros((1, 0, head_dim), dtype, device),
-        }
+        running_compressed_kv(&self.compressed_kv, device, head_dim, dtype)
     }
 
     /// `store_compression_weights`: fold new projections into the buffer, peel
@@ -1206,24 +1242,14 @@ impl CsaCompressionState {
         gate: &Tensor,
         compress_rate: usize,
     ) -> Result<(Tensor, Tensor, usize)> {
-        let first_window_position = self.entry_count * compress_rate;
-        let (kv, gate) = match (&self.buffer_kv, &self.buffer_gate) {
-            (Some(bk), Some(bg)) => (Tensor::cat(&[bk, kv], 1)?, Tensor::cat(&[bg, gate], 1)?),
-            _ => (kv.clone(), gate.clone()),
-        };
-        let len = kv.dim(1)?;
-        let usable = (len / compress_rate) * compress_rate;
-        let rem = len - usable;
-        if rem > 0 {
-            self.buffer_kv = Some(kv.narrow(1, usable, rem)?);
-            self.buffer_gate = Some(gate.narrow(1, usable, rem)?);
-        } else {
-            self.buffer_kv = None;
-            self.buffer_gate = None;
-        }
-        let chunk_kv = kv.narrow(1, 0, usable)?;
-        let chunk_gate = gate.narrow(1, 0, usable)?;
-        Ok((chunk_kv, chunk_gate, first_window_position))
+        store_compression_entries(
+            &mut self.buffer_kv,
+            &mut self.buffer_gate,
+            self.entry_count,
+            kv,
+            gate,
+            compress_rate,
+        )
     }
 
     /// `update_overlap_state`: return the previous window's Ca slice (zero-kv /
@@ -1677,7 +1703,6 @@ impl DeepseekV4Compressor {
 
 /// HCA compression state: buffered source projections, the running list of
 /// emitted compressed entries, and the total window count.
-
 #[derive(Default, Clone, Debug)]
 struct HcaCompressionState {
     buffer_kv: Option<Tensor>,
@@ -1689,10 +1714,7 @@ struct HcaCompressionState {
 impl HcaCompressionState {
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
     fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
-        match &self.compressed_kv {
-            Some(c) => Ok(c.clone()),
-            None => Tensor::zeros((1, 0, head_dim), dtype, device),
-        }
+        running_compressed_kv(&self.compressed_kv, device, head_dim, dtype)
     }
 
     /// Concatenate new `(kv, gate)` projections with the buffered remainder,
@@ -1704,24 +1726,14 @@ impl HcaCompressionState {
         gate: &Tensor,
         compress_rate: usize,
     ) -> Result<(Tensor, Tensor, usize)> {
-        let first_window_position = self.entry_count * compress_rate;
-        let (kv, gate) = match (&self.buffer_kv, &self.buffer_gate) {
-            (Some(bk), Some(bg)) => (Tensor::cat(&[bk, kv], 1)?, Tensor::cat(&[bg, gate], 1)?),
-            _ => (kv.clone(), gate.clone()),
-        };
-        let len = kv.dim(1)?;
-        let usable = (len / compress_rate) * compress_rate;
-        let rem = len - usable;
-        if rem > 0 {
-            self.buffer_kv = Some(kv.narrow(1, usable, rem)?);
-            self.buffer_gate = Some(gate.narrow(1, usable, rem)?);
-        } else {
-            self.buffer_kv = None;
-            self.buffer_gate = None;
-        }
-        let chunk_kv = kv.narrow(1, 0, usable)?;
-        let chunk_gate = gate.narrow(1, 0, usable)?;
-        Ok((chunk_kv, chunk_gate, first_window_position))
+        store_compression_entries(
+            &mut self.buffer_kv,
+            &mut self.buffer_gate,
+            self.entry_count,
+            kv,
+            gate,
+            compress_rate,
+        )
     }
 
     /// Compress every complete non-overlapping window into one KV entry via a
@@ -2152,6 +2164,21 @@ impl DeepseekV4Experts {
     }
 }
 
+/// Normalize the gathered per-token expert weights over the selected experts
+/// (epsilon-denominator `1e-20`) and scale by `routed_scaling_factor`; returns
+/// `(weights [N,K], indices [N,K])`.
+fn finalize_weights(
+    scores: &Tensor,
+    indices: Tensor,
+    routed_scaling_factor: f64,
+) -> Result<(Tensor, Tensor)> {
+    let weights = scores.gather(&indices, D::Minus1)?;
+    let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
+    let weights = weights.broadcast_div(&denom)?;
+    let weights = (weights * routed_scaling_factor)?;
+    Ok((weights, indices))
+}
+
 /// Learned top-k router (`DeepseekV4TopKRouter`): `sqrt_softplus` scores,
 /// top-k indices, weights normalized over the selected experts and scaled by
 /// `routed_scaling_factor`.
@@ -2195,11 +2222,7 @@ impl DeepseekV4TopKRouter {
         let biased =
             scores.broadcast_add(&self.e_score_correction_bias.to_dtype(scores.dtype())?)?;
         let indices = topk_last_dim(&biased, self.top_k)?; // [N, K]
-        let weights = scores.gather(&indices, D::Minus1)?; // [N, K]
-        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
-        let weights = weights.broadcast_div(&denom)?;
-        let weights = (weights * self.routed_scaling_factor)?;
-        Ok((weights, indices))
+        finalize_weights(&scores, indices, self.routed_scaling_factor)
     }
 }
 
@@ -2241,11 +2264,7 @@ impl DeepseekV4HashRouter {
             .index_select(&ids, 0)?
             .to_dtype(DType::I64)?
             .contiguous()?; // [N, K]
-        let weights = scores.gather(&indices, D::Minus1)?;
-        let denom = (weights.sum(D::Minus1)?.unsqueeze(D::Minus1)? + 1e-20)?;
-        let weights = weights.broadcast_div(&denom)?;
-        let weights = (weights * self.routed_scaling_factor)?;
-        Ok((weights, indices))
+        finalize_weights(&scores, indices, self.routed_scaling_factor)
     }
 }
 
