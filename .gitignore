@@ -53,3 +53,6 @@ sample_models/**/model.safetensors
 sample_models/**/model.safetensors.index.json
 sample_models/**/tokenizer.json
 sample_models/**/generation_config.json
+
+# Agent tooling only (just test / just check); not part of the upstream feature.
+justfile
