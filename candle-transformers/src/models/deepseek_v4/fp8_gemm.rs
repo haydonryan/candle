@@ -356,12 +356,20 @@ impl Fp8Weight {
 /// scales folded in via [`Fp8Weight`]). Both the activation scale and the
 /// weight scale fold into `alpha`, so the result is `act @ w` (up to fp8
 /// quantization) in `out_dtype` (`(..., out)`).
+///
+/// Activations are quantized with per-block ue8m0 scales (story #4280):
+/// the `in` dimension is split into `bk = 128`-wide slices, each folded into
+/// the fp8 value, and the reduction is run as one scalar-scaled GEMM per slice
+/// (slice scale folded into that slice's scalar `alpha`) whose fp32 results
+/// are summed. This keeps the per-block accuracy of the checkpoint's dynamic
+/// activation scheme while staying within cuBLASLt's scalar-only fp8x8 mode.
 pub fn fp8_linear(
     blas: &mut BlasLt,
     act: &Tensor,
     w: &Fp8Weight,
     out_dtype: DType,
 ) -> Result<Tensor> {
+    const BK: usize = 128;
     let rank = act.rank();
     let in_ = act.dim(rank - 1)?;
     let out = w.bytes.dim(0)?;
@@ -371,15 +379,31 @@ pub fn fp8_linear(
         .contiguous()?
         .to_dtype(DType::F32)?;
     let v = flat.flatten_all()?.to_vec1::<f32>()?;
-    let (a8, act_scale) = quantize_fp8(&v);
+    let (a8, block_scales) = quantize_fp8_block(&v, lead, in_, BK);
     let a8t = Tensor::from_vec(a8, (lead, in_), act.device())?;
-    let alpha = 1.0 / (act_scale * w.scale);
-    let out_t = fp8_matmul(blas, &a8t, &w.bytes, alpha, out_dtype)?;
+    let nblocks = in_.div_ceil(BK);
+    let mut acc: Option<Tensor> = None;
+    for b in 0..nblocks {
+        let k0 = b * BK;
+        let k1 = (k0 + BK).min(in_);
+        // fp8_matmul requires contiguous rows (lda = k_block); the narrowed
+        // views are strided by the full `in_`, so materialize each slice.
+        let act_b = a8t.narrow(1, k0, k1 - k0)?.contiguous()?;
+        let w_b = w.bytes.narrow(1, k0, k1 - k0)?.contiguous()?;
+        // Slice scale folded into alpha: out += (act_b * 2^s_b) @ w_b / (2^s_b * w.scale)
+        // = act_b @ w_b (per-slice), summed across slices = act @ w.
+        let alpha = 1.0 / (block_scales[b] * w.scale);
+        let part = fp8_matmul(blas, &act_b, &w_b, alpha, out_dtype)?;
+        acc = Some(match acc {
+            None => part,
+            Some(a) => a.add(&part)?,
+        });
+    }
+    let out_t = acc.unwrap();
     let mut dims = act.dims()[..rank - 1].to_vec();
     dims.push(out);
     out_t.reshape(dims)
 }
-
 /// fp8 grouped low-rank linear (block-diagonal over `n_groups`): `act` is
 /// `(..., n_groups, in_per_group)`, `w` is the `(n_groups * out_per_group,
 /// in_per_group)` fp8 weight (single per-tensor scale). Returns
@@ -483,6 +507,48 @@ pub fn quantize_fp8(vals: &[f32]) -> (Vec<u8>, f32) {
         .map(|&v| f32_to_fp8(v * scale))
         .collect::<Vec<_>>();
     (bytes, scale)
+}
+
+/// Quantize a contiguous row-major `(m, k)` f32 activation array to fp8 e4m3
+/// with per-block ue8m0 (F8E8M0) scales over `bk`-wide slices of the `k`
+/// dimension (matching the checkpoint's dynamic activation scheme, `[1, bk]`
+/// blocks like the weights).
+///
+/// Each `k`-slice gets one power-of-two scale `2^s` (with `s` chosen so the
+/// slice's max magnitude maps into `(224, 448]`), shared across all `m` rows.
+/// Because ue8m0 is a power of two, `v * 2^s` only shifts the fp8 exponent —
+/// the scale is folded directly into the fp8 value (exact, like the weight
+/// folding in [`fold_fp8_block_scale`]). The GEMM then splits the reduction by
+/// slice and carries each slice's scale in a scalar `alpha` (see
+/// [`fp8_linear`]), which is exactly what the scalar-scaled cuBLASLt fp8x8
+/// kernels accept.
+///
+/// Returns the folded fp8 bytes (`m * k`) and the per-slice scales `2^s`
+/// (length `ceil(k / bk)`).
+pub fn quantize_fp8_block(vals: &[f32], m: usize, k: usize, bk: usize) -> (Vec<u8>, Vec<f32>) {
+    let nblocks = k.div_ceil(bk);
+    let mut out = vec![0u8; m * k];
+    let mut scales = vec![1.0f32; nblocks];
+    for b in 0..nblocks {
+        let k0 = b * bk;
+        let k1 = (k0 + bk).min(k);
+        let mut mx = 1e-30f32;
+        for i in 0..m {
+            for j in k0..k1 {
+                mx = mx.max(vals[i * k + j].abs());
+            }
+        }
+        // ue8m0 power-of-two scale: floor so the block max maps to <= 448.
+        let s = (448.0 / mx).log2().floor() as i32;
+        let scale = 2f32.powi(s);
+        scales[b] = scale;
+        for i in 0..m {
+            for j in k0..k1 {
+                out[i * k + j] = f32_to_fp8(vals[i * k + j] * scale);
+            }
+        }
+    }
+    (out, scales)
 }
 
 /// Round an f32 to the nearest fp8 e4m3 byte (finite, clamp to range).
