@@ -1025,6 +1025,7 @@ impl Glm5NextForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::LogitsProcessor;
     use candle::{DType, Device, Tensor};
     use std::collections::HashMap;
 
@@ -1504,5 +1505,29 @@ mod tests {
         let a = first.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = after_reset.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b);
+    }
+    /// Reduced local-fixture smoke test (story #4356): prefill a short prompt
+    /// and sample one next token through the example-style greedy decode step,
+    /// without requiring the full 320B checkpoint in CI.
+    #[test]
+    fn generate_one_token_smoke() {
+        let cfg = reduced_config();
+        let dev = Device::Cpu;
+        let mut model = build_model(&cfg, &dev);
+        let mut processor = LogitsProcessor::from_sampling(42, crate::generation::Sampling::ArgMax);
+        let prompt = Tensor::new(&[[1u32, 2, 3]], &dev).unwrap();
+        let logits = model.forward(&prompt, 0).unwrap(); // [1, 3, vocab]
+        let last = logits
+            .narrow(1, 2, 1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap(); // [vocab]
+        let tok = processor.sample(&last).unwrap();
+        assert!(
+            (tok as usize) < cfg.vocab_size,
+            "sampled token {tok} out of vocab range"
+        );
     }
 }
