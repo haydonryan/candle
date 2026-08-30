@@ -9,7 +9,7 @@ use clap::Parser;
 
 use candle_transformers::models::deepseek_v4::{DeepseekV4Config, DeepseekV4ForCausalLM};
 
-use candle::{D, DType, Tensor};
+use candle::{DType, Tensor, D};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};

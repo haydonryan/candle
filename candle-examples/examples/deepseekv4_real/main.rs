@@ -6,10 +6,10 @@ extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, IndexOp, Tensor};
+use candle_transformers::models::deepseek_v4::DeepseekV4Config;
 use candle_transformers::models::quantized_deepseek_v4::{
     load_quantized_for_causal_lm, DeepseekV4Quantized,
 };
-use candle_transformers::models::deepseek_v4::DeepseekV4Config;
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;

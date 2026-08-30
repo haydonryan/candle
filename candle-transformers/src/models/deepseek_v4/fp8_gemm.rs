@@ -587,7 +587,6 @@ pub fn f32_to_fp8(v: f32) -> u8 {
     ((e8 << 3) as u8 | m8 as u8) | neg
 }
 
-
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

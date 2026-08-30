@@ -174,14 +174,14 @@ fn time_prefill(dev: &Device, cfg: &DeepseekV4Config, label: &str, seq_len: usiz
         .unwrap();
 
     // Warm-up.
-    let _ = eager.forward(&x, 0, None).unwrap();
-    let _ = flash.forward(&x, 0, None).unwrap();
+    let _ = eager.forward(&x, 0).unwrap();
+    let _ = flash.forward(&x, 0).unwrap();
     dev.synchronize().unwrap();
 
     let t_eager = {
         let start = Instant::now();
         for _ in 0..iters {
-            let _ = eager.forward(&x, 0, None).unwrap();
+            let _ = eager.forward(&x, 0).unwrap();
         }
         dev.synchronize().unwrap();
         start.elapsed().as_secs_f64() / iters as f64
@@ -189,7 +189,7 @@ fn time_prefill(dev: &Device, cfg: &DeepseekV4Config, label: &str, seq_len: usiz
     let t_flash = {
         let start = Instant::now();
         for _ in 0..iters {
-            let _ = flash.forward(&x, 0, None).unwrap();
+            let _ = flash.forward(&x, 0).unwrap();
         }
         dev.synchronize().unwrap();
         start.elapsed().as_secs_f64() / iters as f64
@@ -213,7 +213,6 @@ fn time_decode(dev: &Device, cfg: &DeepseekV4Config, label: &str, n_steps: usize
                 .to_dtype(DType::BF16)
                 .unwrap(),
             0,
-            None,
         )
         .unwrap();
     let _ = flash
@@ -222,7 +221,6 @@ fn time_decode(dev: &Device, cfg: &DeepseekV4Config, label: &str, n_steps: usize
                 .to_dtype(DType::BF16)
                 .unwrap(),
             0,
-            None,
         )
         .unwrap();
     dev.synchronize().unwrap();
@@ -234,7 +232,7 @@ fn time_decode(dev: &Device, cfg: &DeepseekV4Config, label: &str, n_steps: usize
             let x = det_tensor(&[1, 1, cfg.hidden_size], (61 + step) as f32, dev)
                 .to_dtype(DType::BF16)
                 .unwrap();
-            let _ = eager.forward(&x, step, None).unwrap();
+            let _ = eager.forward(&x, step).unwrap();
         }
         dev.synchronize().unwrap();
         start.elapsed().as_secs_f64() / n_steps as f64
@@ -246,7 +244,7 @@ fn time_decode(dev: &Device, cfg: &DeepseekV4Config, label: &str, n_steps: usize
             let x = det_tensor(&[1, 1, cfg.hidden_size], (61 + step) as f32, dev)
                 .to_dtype(DType::BF16)
                 .unwrap();
-            let _ = flash.forward(&x, step, None).unwrap();
+            let _ = flash.forward(&x, step).unwrap();
         }
         dev.synchronize().unwrap();
         start.elapsed().as_secs_f64() / n_steps as f64
