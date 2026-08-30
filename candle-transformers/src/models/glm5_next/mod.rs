@@ -10,13 +10,13 @@
 //! the GLM-5.3 attention/MLP blocks. Where GLM-5.3 reuses an architecture
 //! primitive that already exists in the `deepseek_v4` module (Manifold
 //! Constrained Hyper-Connection, and the routed/shared MoE expert weights),
-//! this module reuses that code by implementing the small config traits those
-//! primitives are generic over, rather than copying them.
-
 use crate::models::deepseek_v4::{HyperConnectionConfig, MoeExpertsConfig};
 use crate::serde_default_fn;
 use candle_nn::Activation;
 use serde::Deserialize;
+
+/// KDA linear attention block (story #4354).
+pub mod kda;
 
 serde_default_fn!(usize, default_num_key_value_heads, 64);
 serde_default_fn!(usize, default_n_shared_experts, 1);
