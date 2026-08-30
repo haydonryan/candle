@@ -9,7 +9,7 @@ use clap::Parser;
 
 use candle_transformers::models::deepseek_v4::{DeepseekV4Config, DeepseekV4ForCausalLM};
 
-use candle::{D, DType, Tensor};
+use candle::{DType, Tensor, D};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -105,11 +105,9 @@ fn main() -> Result<()> {
         let prompt = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
         let logits = model.forward(&prompt, 0)?.to_dtype(DType::F32)?; // [1, S, vocab]
         let flat = logits.flatten_all()?.to_vec1::<f32>()?;
-        serde_json::to_writer(
-            std::io::BufWriter::new(std::fs::File::create(&path)?),
-            &flat,
-        )
-        .map_err(E::msg)?;
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        serde_json::to_writer(&mut writer, &flat).map_err(E::msg)?;
+        writer.flush().map_err(E::msg)?;
         println!("wrote {} logits to {}", flat.len(), path.display());
         return Ok(());
     }

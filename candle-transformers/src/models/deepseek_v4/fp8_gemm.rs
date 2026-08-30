@@ -163,11 +163,9 @@ impl BlasLt {
         d: *mut u8,
     ) -> Result<()> {
         let (a_rows, a_cols) = (cfg.m, cfg.k);
-        let (b_rows, b_cols) = if cfg.transb {
-            (cfg.n, cfg.k)
-        } else {
-            (cfg.k, cfg.n)
-        };
+        // B is always the transposed weight: `act (M,K) @ w^T (K,N) -> (M,N)`,
+        // so B's layout is `(N, K)` with leading dim `ldb = K`.
+        let (b_rows, b_cols) = (cfg.n, cfg.k);
         let a_layout = Layout::new(sys::cudaDataType_t::CUDA_R_8F_E4M3, a_rows, a_cols, cfg.lda)?;
         let b_layout = Layout::new(sys::cudaDataType_t::CUDA_R_8F_E4M3, b_rows, b_cols, cfg.ldb)?;
         let c_layout = Layout::new(sys::cudaDataType_t::CUDA_R_32F, cfg.m, cfg.n, cfg.ldc)?;
@@ -177,8 +175,8 @@ impl BlasLt {
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             sys::cudaDataType_t::CUDA_R_32F,
         )?;
-        desc.set_transpose(cfg.transa, Matrix::A)?;
-        desc.set_transpose(cfg.transb, Matrix::B)?;
+        desc.set_transpose(false, Matrix::A)?;
+        desc.set_transpose(true, Matrix::B)?;
 
         let pref = Pref::new()?;
         pref.set_workspace(WORKSPACE_BYTES)?;
@@ -230,8 +228,6 @@ impl Drop for BlasLt {
 
 /// GEMM shape config for [`BlasLt::fp8x8_gemm`].
 struct GemmConfig {
-    transa: bool,
-    transb: bool,
     m: u64,
     n: u64,
     k: u64,
@@ -243,13 +239,11 @@ struct GemmConfig {
 impl GemmConfig {
     /// `act` is `(M, K)`; weight is on-disk `(N, K)` (candle Linear
     /// orientation, so the right operand is its transpose).
-    fn linear(act: &Tensor, out: usize, inp: usize, transb: bool) -> Result<GemmConfig> {
+    fn linear(act: &Tensor, out: usize, inp: usize) -> Result<GemmConfig> {
         let m = act.dim(0)? as u64;
         let k = inp as u64;
         let n = out as u64;
         Ok(GemmConfig {
-            transa: false,
-            transb,
             m,
             n,
             k,
@@ -304,7 +298,7 @@ pub fn fp8_matmul(
     let (n, k) = w8.dims2()?;
     let dev = act_fp8.device().as_cuda_device()?.clone();
     let stream = get_stream(act_fp8)?;
-    let cfg = GemmConfig::linear(act_fp8, n, k, true)?;
+    let cfg = GemmConfig::linear(act_fp8, n, k)?;
     let mut out_slice = alloc_f32(&dev, (cfg.m * cfg.n) as usize)?;
     let (d_ptr, _) = out_slice.device_ptr_mut(&stream);
     let d_ptr = d_ptr as *mut u8;
@@ -420,7 +414,7 @@ pub fn fp8_linear(
             Some(a) => a.add(&part)?,
         });
     }
-    let out_t = acc.unwrap();
+    let out_t = acc.ok_or_else(|| Error::msg("fp8_linear: empty reduction"))?;
     let mut dims = act.dims()[..rank - 1].to_vec();
     dims.push(out);
     out_t.reshape(dims)
@@ -586,7 +580,6 @@ pub fn f32_to_fp8(v: f32) -> u8 {
     }
     ((e8 << 3) as u8 | m8 as u8) | neg
 }
-
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {

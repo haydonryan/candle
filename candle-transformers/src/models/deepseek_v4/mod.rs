@@ -9,9 +9,9 @@
 //! use `rope_theta`, compressor layers use `compress_rope_theta` with Yarn
 //! scaling).
 
+use crate::serde_default_fn;
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
-use crate::serde_default_fn;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -124,10 +124,14 @@ serde_default_fn!(f64, default_routed_scaling_factor, 1.0);
 // `qk_rope_head_dim` (64) / `head_dim` (512), as in transformers.
 serde_default_fn!(f64, default_partial_rotary_factor, 64.0 / 512.0);
 serde_default_fn!(bool, default_fp8_attention, false);
-serde_default_fn!(CompressRates, default_compress_rates, CompressRates {
-    compressed_sparse_attention: 4,
-    heavily_compressed_attention: 128,
-});
+serde_default_fn!(
+    CompressRates,
+    default_compress_rates,
+    CompressRates {
+        compressed_sparse_attention: 4,
+        heavily_compressed_attention: 128,
+    }
+);
 /// DeepSeek-V4 configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepseekV4Config {
@@ -626,7 +630,6 @@ fn flash_attn_blockmask(
     unimplemented!("compile with '--features flash-attn'")
 }
 
-
 /// Per-block fp8 quantization of an attention Q/K/V tensor (story #4280),
 /// matching DeepSeek-V4's `activation_scheme: dynamic` with F8E8M0 (ue8m0)
 /// per-block scales: the last dimension (`head_dim`) is split into
@@ -925,11 +928,7 @@ impl DeepseekV4Attention {
         }
     }
 
-    pub fn forward(
-        &mut self,
-        xs: &Tensor,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
+    pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
         let num_heads = self.cfg.num_attention_heads;
         let head_dim = self.cfg.head_dim;
@@ -1079,6 +1078,7 @@ impl DeepseekV4Attention {
 
     /// Compressed (CSA/HCA) layer: append the long-range compressed KV and
     /// extend the additive mask with the compressor's block_bias over the suffix.
+    #[allow(clippy::too_many_arguments)]
     fn compressed_kv_mask(
         &mut self,
         xs: &Tensor,
@@ -1091,11 +1091,11 @@ impl DeepseekV4Attention {
         prev_len: usize,
         bs: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (compressed_kv, block_bias) = self
+        let compressor = self
             .compressor
             .as_mut()
-            .unwrap()
-            .forward(xs, q_residual, seqlen_offset)?;
+            .ok_or_else(|| candle::Error::msg("compressed layer missing compressor"))?;
+        let (compressed_kv, block_bias) = compressor.forward(xs, q_residual, seqlen_offset)?;
         let k = Tensor::cat(&[k.clone(), compressed_kv.clone()], 2)?;
         let v = Tensor::cat(&[v, &compressed_kv], 2)?;
         let sliding = self
@@ -1105,8 +1105,6 @@ impl DeepseekV4Attention {
         Ok((k, v, mask))
     }
 }
-
-
 
 /// Per-row top-k along the last dim, sorted descending (largest first).
 /// Returns the indices of the `k` largest values of each row.
@@ -1177,6 +1175,12 @@ fn running_compressed_kv(
     match compressed_kv {
         Some(c) => Ok(c.clone()),
         None => Tensor::zeros((1, 0, head_dim), dtype, device),
+    }
+}
+
+impl Default for CsaCompressionState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1663,7 +1667,6 @@ impl DeepseekV4Compressor {
         }
     }
 }
-
 
 /// HCA compression state: buffered source projections, the running list of
 /// emitted compressed entries, and the total window count.
@@ -2285,7 +2288,11 @@ impl DeepseekV4SparseMoeBlock {
         let flat = x.reshape((bs * seq, d))?;
         let (weights, indices) = match &self.gate {
             DeepseekV4MoeGate::TopK(g) => g.forward(&flat)?,
-            DeepseekV4MoeGate::Hash(g) => g.forward(&flat, input_ids.unwrap())?,
+            DeepseekV4MoeGate::Hash(g) => {
+                let ids = input_ids
+                    .ok_or_else(|| candle::Error::msg("hash-routed layer requires input_ids"))?;
+                g.forward(&flat, ids)?
+            }
         };
         let routed = self
             .experts
@@ -2371,7 +2378,6 @@ impl DeepseekV4DecoderLayer {
                     .matmul(&hidden_states)?,
             )
     }
-
 
     pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
@@ -2506,7 +2512,6 @@ mod tests {
         assert_eq!(cfg.compress_rates.heavily_compressed_attention, 128);
         assert_eq!(cfg.compress_ratios, vec![0, 0, 4, 128, 4, 128, 4, 0]);
         assert_eq!(cfg.rope_scaling.scaling_type, ScaledRopeType::Yarn);
-
     }
 
     /// The real deepseek-ai DeepSeek-V4-Flash `config.json` ships neither
@@ -3899,7 +3904,6 @@ mod tests {
         cfg.o_lora_rank = 512;
         check_flash_eager_decode_parity(&cfg, "v4flash-head_dim-512-64h", &dev, 300)
     }
-
 
     /// Base head_dim 4 smoke parity.
     #[cfg(feature = "flash-attn")]

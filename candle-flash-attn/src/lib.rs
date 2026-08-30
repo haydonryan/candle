@@ -1066,8 +1066,6 @@ pub fn flash_attn_windowed_blockmask(
     q.apply_op3(k, v, op)
 }
 
-#[allow(clippy::too_many_arguments)]
-
 /// Custom-op3 wrapper for [`flash_attn_windowed_blockmask`]. Holds the additive mask and the
 /// per-head sink logits; `cuda_fwd` launches the fused BF16 kernel.
 pub struct FlashAttnBlockMask {

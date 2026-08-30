@@ -437,14 +437,7 @@ impl DeepseekV4Quantized {
         max_bytes: usize,
         gpu_max_bytes: usize,
     ) -> Result<Self> {
-        Self::new(
-            paths,
-            (128, 128),
-            dev,
-            out_dtype,
-            max_bytes,
-            gpu_max_bytes,
-        )
+        Self::new(paths, (128, 128), dev, out_dtype, max_bytes, gpu_max_bytes)
     }
 
     /// True if `name` is a tensor present in the checkpoint.
@@ -799,7 +792,7 @@ pub unsafe fn load_quantized_for_causal_lm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::deepseek_v4::{DeepseekV4Config, DeepseekV4ForCausalLM};
+    use crate::models::deepseek_v4::DeepseekV4Config;
 
     fn close(a: f32, b: f32, tol: f32, label: &str) {
         let ok = (a.is_nan() && b.is_nan())
