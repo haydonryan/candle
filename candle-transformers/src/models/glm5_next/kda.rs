@@ -89,7 +89,7 @@ impl RmsNormGated {
         let normed = xf.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
         let gate_f = candle_nn::ops::sigmoid(&gate.to_dtype(DType::F32)?)?;
-        Ok(normed.broadcast_mul(&gate_f)?.to_dtype(dtype)?)
+        normed.broadcast_mul(&gate_f)?.to_dtype(dtype)
     }
 }
 
@@ -405,12 +405,10 @@ impl KdaLinearAttention {
 
         // Split Q/K/V and reshape to `[B, T, num_heads, head_dim]`.
         let shape = (b, seq_len, self.num_heads, self.head_dim);
-        let q = conv_out
-            .narrow(2, 0, self.qkv_dim)?
-            .reshape(shape.clone())?;
+        let q = conv_out.narrow(2, 0, self.qkv_dim)?.reshape(shape)?;
         let k = conv_out
             .narrow(2, self.qkv_dim, self.qkv_dim)?
-            .reshape(shape.clone())?;
+            .reshape(shape)?;
         let v = conv_out
             .narrow(2, 2 * self.qkv_dim, self.qkv_dim)?
             .reshape(shape)?;
