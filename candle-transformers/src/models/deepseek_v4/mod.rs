@@ -225,6 +225,68 @@ impl DeepseekV4Config {
             .collect()
     }
 }
+/// Minimal config surface required to construct the shared mHC components
+/// (`DeepseekV4HyperConnection`, `DeepseekV4HyperHead`). Implemented by
+/// `DeepseekV4Config` and reused by the `glm5_next` module so GLM-5.3 reuses
+/// the same Manifold-Constrained Hyper-Connection code instead of copying it.
+pub trait HyperConnectionConfig {
+    fn hc_mult(&self) -> usize;
+    fn hc_sinkhorn_iters(&self) -> usize;
+    fn hc_eps(&self) -> f64;
+    fn hidden_size(&self) -> usize;
+    fn rms_norm_eps(&self) -> f64;
+}
+
+impl HyperConnectionConfig for DeepseekV4Config {
+    fn hc_mult(&self) -> usize {
+        self.hc_mult
+    }
+    fn hc_sinkhorn_iters(&self) -> usize {
+        self.hc_sinkhorn_iters
+    }
+    fn hc_eps(&self) -> f64 {
+        self.hc_eps
+    }
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+}
+
+/// Minimal config surface required to construct the shared MoE expert weights
+/// (`DeepseekV4Experts` routed experts + `DeepseekV4MLP` shared expert).
+/// Implemented by `DeepseekV4Config` and reused by the `glm5_next` module so
+/// GLM-5.3 reuses the same MoE compute instead of copying it.
+pub trait MoeExpertsConfig {
+    fn n_routed_experts(&self) -> usize;
+    fn moe_intermediate_size(&self) -> usize;
+    fn hidden_size(&self) -> usize;
+    fn swiglu_limit(&self) -> f64;
+    #[cfg(feature = "cuda")]
+    fn fp8_compute(&self) -> bool;
+}
+
+impl MoeExpertsConfig for DeepseekV4Config {
+    fn n_routed_experts(&self) -> usize {
+        self.n_routed_experts
+    }
+    fn moe_intermediate_size(&self) -> usize {
+        self.moe_intermediate_size
+    }
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn swiglu_limit(&self) -> f64 {
+        self.swiglu_limit
+    }
+    #[cfg(feature = "cuda")]
+    fn fp8_compute(&self) -> bool {
+        self.fp8_compute
+    }
+}
+
 /// Unweighted RMS normalization, matching DeepSeek-V4 `UnweightedRMSNorm`:
 /// `x * rsqrt(mean(x^2) + eps)`. The norm factor is computed in f32 and the
 /// multiplication is performed in the input's dtype (as in the reference).
@@ -1873,17 +1935,17 @@ pub struct DeepseekV4HyperConnection {
 }
 
 impl DeepseekV4HyperConnection {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let hc = cfg.hc_mult;
+    pub fn new<C: HyperConnectionConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let hc = cfg.hc_mult();
         let mix = (2 + hc) * hc;
-        let fn_ = vb.get((mix, hc * cfg.hidden_size), "fn")?;
+        let fn_ = vb.get((mix, hc * cfg.hidden_size()), "fn")?;
         let base = vb.get((mix,), "base")?;
         let scale = vb.get((3,), "scale")?;
         Ok(Self {
             hc_mult: hc,
-            hc_sinkhorn_iters: cfg.hc_sinkhorn_iters,
-            hc_eps: cfg.hc_eps,
-            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps),
+            hc_sinkhorn_iters: cfg.hc_sinkhorn_iters(),
+            hc_eps: cfg.hc_eps(),
+            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps()),
             fn_,
             base,
             scale,
@@ -1952,14 +2014,14 @@ pub struct DeepseekV4HyperHead {
 }
 
 impl DeepseekV4HyperHead {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let hc = cfg.hc_mult;
-        let hc_fn = vb.get((hc, hc * cfg.hidden_size), "hc_fn")?;
+    pub fn new<C: HyperConnectionConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let hc = cfg.hc_mult();
+        let hc_fn = vb.get((hc, hc * cfg.hidden_size()), "hc_fn")?;
         let hc_base = vb.get((hc,), "hc_base")?;
         let hc_scale = vb.get((1,), "hc_scale")?;
         Ok(Self {
-            hc_eps: cfg.hc_eps,
-            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps),
+            hc_eps: cfg.hc_eps(),
+            input_norm: UnweightedRMSNorm::new(cfg.rms_norm_eps()),
             hc_fn,
             hc_base,
             hc_scale,
@@ -1999,9 +2061,9 @@ pub struct DeepseekV4MLP {
 }
 
 impl DeepseekV4MLP {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let inter = cfg.moe_intermediate_size;
-        let hidden = cfg.hidden_size;
+    pub fn new<C: MoeExpertsConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let inter = cfg.moe_intermediate_size();
+        let hidden = cfg.hidden_size();
         let gate_proj = candle_nn::linear_no_bias(hidden, inter, vb.pp("gate_proj"))?;
         let up_proj = candle_nn::linear_no_bias(hidden, inter, vb.pp("up_proj"))?;
         let down_proj = candle_nn::linear_no_bias(inter, hidden, vb.pp("down_proj"))?;
@@ -2009,7 +2071,7 @@ impl DeepseekV4MLP {
             gate_proj,
             up_proj,
             down_proj,
-            limit: cfg.swiglu_limit,
+            limit: cfg.swiglu_limit(),
         })
     }
 
@@ -2036,14 +2098,14 @@ pub struct DeepseekV4Experts {
 }
 
 impl DeepseekV4Experts {
-    pub fn new(cfg: &DeepseekV4Config, vb: VarBuilder) -> Result<Self> {
-        let e = cfg.n_routed_experts;
-        let inter = cfg.moe_intermediate_size;
-        let hidden = cfg.hidden_size;
+    pub fn new<C: MoeExpertsConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let e = cfg.n_routed_experts();
+        let inter = cfg.moe_intermediate_size();
+        let hidden = cfg.hidden_size();
         let gate_up_proj = vb.get((e, 2 * inter, hidden), "gate_up_proj")?;
         let down_proj = vb.get((e, hidden, inter), "down_proj")?;
         #[cfg(feature = "cuda")]
-        let fp8 = if cfg.fp8_compute {
+        let fp8 = if cfg.fp8_compute() {
             let compute = Fp8Compute::new(vb.device())?;
             // Flatten to `(E * rows, cols)` so each expert occupies a contiguous
             // row block (gate_up `[E, 2*inter, hidden]`, down `[E, hidden, inter]`).
@@ -2061,7 +2123,7 @@ impl DeepseekV4Experts {
             num_experts: e,
             gate_up_proj,
             down_proj,
-            limit: cfg.swiglu_limit,
+            limit: cfg.swiglu_limit(),
             #[cfg(feature = "cuda")]
             fp8,
         })
