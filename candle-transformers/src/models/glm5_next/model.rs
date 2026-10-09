@@ -723,9 +723,9 @@ impl Glm5NextTextAttention {
         let mask = self.build_attention_mask_from_topk(&topk_indices, kv_len)?;
 
         // Eager attention over the sparse top-k mask.
-        let qf = query_states.to_dtype(DType::F32)?;
-        let kf = key_states.to_dtype(DType::F32)?;
-        let vf = value_states.to_dtype(DType::F32)?;
+        let qf = query_states.to_dtype(DType::F32)?.contiguous()?;
+        let kf = key_states.to_dtype(DType::F32)?.contiguous()?;
+        let vf = value_states.to_dtype(DType::F32)?.contiguous()?;
         let att = (qf.matmul(&kf.t()?)? * self.scaling)?;
         let att = att.broadcast_add(&mask)?;
         let att = candle_nn::ops::softmax_last_dim(&att)?;
