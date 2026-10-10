@@ -288,7 +288,19 @@ impl KdaLinearAttention {
         let q_proj = linear_no_bias(hidden_size, qkv_dim, vb.pp("q_proj"))?;
         let k_proj = linear_no_bias(hidden_size, qkv_dim, vb.pp("k_proj"))?;
         let v_proj = linear_no_bias(hidden_size, qkv_dim, vb.pp("v_proj"))?;
-        let conv_weight = vb.get((conv_dim, 1, conv_kernel), "conv1d.weight")?;
+        let conv_weight = if vb.contains_tensor("conv1d.weight") {
+            // Older / synthetic checkpoints store a single concatenated
+            // short-conv weight: [conv_dim, 1, conv_kernel].
+            vb.get((conv_dim, 1, conv_kernel), "conv1d.weight")?
+        } else {
+            // The real GLM-5.3-Flash checkpoint stores separate per-branch
+            // short-conv weights [qkv_dim, 1, conv_kernel]; concat q, k, v in
+            // branch order to match the forward path's [q, k, v] cat.
+            let q = vb.get((qkv_dim, 1, conv_kernel), "q_conv1d.weight")?;
+            let k = vb.get((qkv_dim, 1, conv_kernel), "k_conv1d.weight")?;
+            let v = vb.get((qkv_dim, 1, conv_kernel), "v_conv1d.weight")?;
+            Tensor::cat(&[q, k, v], 0)?
+        };
         let forget_gate = KdaForgetGate::new(cfg, vb.pp("forget_gate"))?;
         let b_proj = linear_no_bias(hidden_size, num_heads, vb.pp("b_proj"))?;
         let g_a_proj = linear_no_bias(hidden_size, head_dim, vb.pp("g_a_proj"))?;
@@ -594,6 +606,69 @@ mod tests {
         put(&mut tensors, "o_proj.weight", &ws.o);
         let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
         KdaLinearAttention::new(&cfg(), 0, vb)
+    }
+
+    #[test]
+    fn qkv_conv1d_matches_single_conv1d() -> candle::Result<()> {
+        let dev = Device::Cpu;
+        let ws = gen_weights();
+
+        // Build with the split q/k/v format and the single concatenated format
+        // from the same source conv weights, and assert they load identically.
+        let single = build_block(&ws, &dev)?;
+
+        let mut tensors = HashMap::new();
+        let put = |t: &mut HashMap<String, Tensor>, name: &str, data: &[f32]| {
+            let shp: candle::Shape = match name {
+                "q_proj.weight" | "k_proj.weight" | "v_proj.weight" => (QKVD, HIDDEN).into(),
+                "q_conv1d.weight" | "k_conv1d.weight" | "v_conv1d.weight" => {
+                    (QKVD, 1, KERNEL).into()
+                }
+                "forget_gate.f_a_proj.weight" | "g_a_proj.weight" => (HEAD_DIM, HIDDEN).into(),
+                "forget_gate.f_b_proj.weight" | "g_b_proj.weight" => (QKVD, HEAD_DIM).into(),
+                "forget_gate.dt_bias" => (QKVD,).into(),
+                "forget_gate.A_log" => (HEADS,).into(),
+                "b_proj.weight" => (HEADS, HIDDEN).into(),
+                "o_norm.weight" => (HEAD_DIM,).into(),
+                "o_proj.weight" => (HIDDEN, QKVD).into(),
+                _ => unreachable!(),
+            };
+            t.insert(
+                name.to_string(),
+                Tensor::from_vec(data.to_vec(), shp, &dev).unwrap(),
+            );
+        };
+        // Split the single conv into q/k/v chunks by branch.
+        let q_conv: Vec<f32> = ws.conv[..QKVD * KERNEL].to_vec();
+        let k_conv: Vec<f32> = ws.conv[QKVD * KERNEL..2 * QKVD * KERNEL].to_vec();
+        let v_conv: Vec<f32> = ws.conv[2 * QKVD * KERNEL..].to_vec();
+        put(&mut tensors, "q_proj.weight", &ws.q);
+        put(&mut tensors, "k_proj.weight", &ws.k);
+        put(&mut tensors, "v_proj.weight", &ws.v);
+        put(&mut tensors, "q_conv1d.weight", &q_conv);
+        put(&mut tensors, "k_conv1d.weight", &k_conv);
+        put(&mut tensors, "v_conv1d.weight", &v_conv);
+        put(&mut tensors, "forget_gate.f_a_proj.weight", &ws.f_a);
+        put(&mut tensors, "forget_gate.f_b_proj.weight", &ws.f_b);
+        put(&mut tensors, "forget_gate.dt_bias", &ws.dt_bias);
+        put(&mut tensors, "forget_gate.A_log", &ws.a_log);
+        put(&mut tensors, "b_proj.weight", &ws.b);
+        put(&mut tensors, "g_a_proj.weight", &ws.g_a);
+        put(&mut tensors, "g_b_proj.weight", &ws.g_b);
+        put(&mut tensors, "o_norm.weight", &ws.o_norm);
+        put(&mut tensors, "o_proj.weight", &ws.o);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+        let split = KdaLinearAttention::new(&cfg(), 0, vb)?;
+
+        // The concatenated q/k/v conv weight must equal the single conv weight.
+        let single_w = single.conv_weight.flatten_all()?.to_vec1::<f32>()?;
+        let split_w = split.conv_weight.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(single_w.len(), CONV_DIM * KERNEL);
+        assert_eq!(split_w.len(), CONV_DIM * KERNEL);
+        for (a, b) in single_w.iter().zip(split_w.iter()) {
+            assert!((a - b).abs() < 1e-6, "conv weight mismatch: {a} vs {b}");
+        }
+        Ok(())
     }
 
     // ---- Pure-f32 reference (independent of the candle block) ----
