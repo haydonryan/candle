@@ -19,6 +19,7 @@
 //! training, FP8/NVFP4/GGUF, tensor parallelism, or new optimized kernels.
 
 use super::kda::KdaLinearAttention;
+use super::vision::Glm5NextVisionModel;
 use super::{Glm5NextTextConfig, IndexerType, LayerType, MlpLayerType};
 use crate::models::deepseek_v4::{DeepseekV4Experts, DeepseekV4HyperConnection};
 use candle::{DType, Result, Tensor, D};
@@ -972,10 +973,16 @@ impl Glm5NextTextModel {
     /// states `[B, S, hidden]`. `_seqlen_offset` is accepted for API
     /// consistency with nearby Candle causal models; the KDA / DSA caches are
     /// stateful and drive decode internally.
-    pub fn forward(&mut self, input_ids: &Tensor, _seqlen_offset: usize) -> Result<Tensor> {
-        let (bs, seq) = input_ids.dims2()?;
-        let dev = input_ids.device();
+    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let emb = self.embed_tokens.forward(input_ids)?; // [B, S, D]
+        self.forward_embeds(&emb, seqlen_offset)
+    }
+
+    /// Runs the full stack over precomputed embeddings `[B, S, D]` (used by the
+    /// multimodal path, which injects vision embeddings before the transformer).
+    pub fn forward_embeds(&mut self, emb: &Tensor, _seqlen_offset: usize) -> Result<Tensor> {
+        let (bs, seq, _) = emb.dims3()?;
+        let dev = emb.device();
         let hidden = emb
             .unsqueeze(2)?
             .broadcast_as((bs, seq, self.hc_mult, self.hidden_size))?
@@ -999,22 +1006,112 @@ impl Glm5NextTextModel {
 }
 
 /// `Glm5NextForCausalLM`: the text model plus a separate (untied) `lm_head`.
+/// When constructed with a vision config (`new_vision`), it also hosts the
+/// vision tower and can inject image-token embeddings (story #5889).
 pub struct Glm5NextForCausalLM {
     model: Glm5NextTextModel,
     lm_head: Linear,
+    vision: Option<Glm5NextVisionModel>,
+    image_token_id: usize,
 }
 
 impl Glm5NextForCausalLM {
     pub fn new(cfg: &Glm5NextTextConfig, vb: VarBuilder) -> Result<Self> {
         let model = Glm5NextTextModel::new(cfg, vb.pp("model"))?;
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
-        Ok(Self { model, lm_head })
+        Ok(Self {
+            model,
+            lm_head,
+            vision: None,
+            image_token_id: 0,
+        })
+    }
+
+    /// Build a multimodal `Glm5NextForCausalLM` with the vision tower. The
+    /// vision `out_hidden_size` must equal the text `hidden_size` so image
+    /// embeddings can be injected at `image_token_id` positions.
+    pub fn new_vision(
+        text_cfg: &Glm5NextTextConfig,
+        vision_cfg: &crate::models::glm5_next::vision::Glm5NextVisionConfig,
+        image_token_id: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        if vision_cfg.out_hidden_size != text_cfg.hidden_size {
+            candle::bail!(
+                "vision out_hidden_size ({}) must equal text hidden_size ({})",
+                vision_cfg.out_hidden_size,
+                text_cfg.hidden_size
+            );
+        }
+        let model = Glm5NextTextModel::new(text_cfg, vb.pp("model"))?;
+        let lm_head = linear_no_bias(text_cfg.hidden_size, text_cfg.vocab_size, vb.pp("lm_head"))?;
+        let vision = Glm5NextVisionModel::new(vision_cfg, vb.pp("model.visual"))?;
+        Ok(Self {
+            model,
+            lm_head,
+            vision: Some(vision),
+            image_token_id,
+        })
     }
 
     /// Returns `[B, S, vocab]` logits.
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let hidden = self.model.forward(input_ids, seqlen_offset)?;
         self.lm_head.forward(&hidden)
+    }
+
+    /// Multimodal forward: runs the vision tower on `pixel_values`/`grid_thw`,
+    /// injects the resulting embeddings at the `image_token_id` positions, then
+    /// runs the text transformer and `lm_head`. When no vision config is present
+    /// (or no pixel input is given) this falls back to the text-only path.
+    ///
+    /// - `pixel_values`: `[num_images, grid_h*grid_w, patch_dim]`
+    /// - `grid_thw`: `[num_images, 3]` (`[t, grid_h, grid_w]`)
+    pub fn forward_vision(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        grid_thw: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (pixel_values, grid_thw) = match (pixel_values, grid_thw) {
+            (Some(p), Some(g)) => (p, g),
+            _ => return self.forward(input_ids, seqlen_offset),
+        };
+        let vision = match &self.vision {
+            Some(v) => v,
+            None => return self.forward(input_ids, seqlen_offset),
+        };
+        // Vision embeddings for every image patch, in image order.
+        let image_embeds = vision.forward(pixel_values, grid_thw)?; // [M, hidden]
+
+        // Text embeddings [B, S, hidden], then replace image-token rows.
+        let emb = self.model.embed_tokens.forward(input_ids)?;
+        let (bs, seq, hidden) = emb.dims3()?;
+        let mask = input_ids.eq(self.image_token_id as u32)?; // [B, S] bool
+        let mask_flat = mask.flatten_all()?; // [P]
+        let total = bs * seq;
+        // rank of each position among the mask positions: cumsum(mask) - 1.
+        let rank = mask_flat
+            .to_dtype(DType::F32)?
+            .cumsum(0)?
+            .affine(1.0, -1.0)?; // [P] f32
+                                 // Gather image_embeds rows by rank (used only where mask is true; the
+                                 // non-mask rows are discarded afterwards by `where_cond`).
+        let m = image_embeds.dims()[0];
+        let idx = rank
+            .clamp(0.0, (m as f32) - 1.0)?
+            .unsqueeze(1)?
+            .broadcast_as((total, hidden))?
+            .to_dtype(DType::I64)?; // [P, hidden]
+        let img_ext = image_embeds.gather(&idx, 0)?; // [P, hidden]
+        let mask3 = mask_flat.unsqueeze(1)?.broadcast_as((total, hidden))?;
+        let emb_flat = emb.reshape((total, hidden))?;
+        let out = mask3
+            .where_cond(&img_ext, &emb_flat)?
+            .reshape((bs, seq, hidden))?;
+        let hidden_states = self.model.forward_embeds(&out, seqlen_offset)?;
+        self.lm_head.forward(&hidden_states)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -1620,5 +1717,215 @@ mod tests {
             let sv = single_dec.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             close_vec(&bv, &sv, 1e-4, &format!("decode batch row {b}"));
         }
+    }
+
+    /// Reduced `glm5_next_vision` config (story #5889): small enough to fit a
+    /// unit test while exercising the full patch-embed -> blocks -> downsample
+    /// -> merger pipeline. `out_hidden_size == text hidden_size (32)` so image
+    /// embeddings can be injected into the text model.
+    fn reduced_vision_config() -> crate::models::glm5_next::vision::Glm5NextVisionConfig {
+        serde_json::from_str(
+            r#"{
+                "hidden_size": 8, "depth": 2, "num_heads": 2, "image_size": 4,
+                "in_channels": 1, "intermediate_size": 16, "out_hidden_size": 32,
+                "patch_size": 2, "projection_intermediate_size": 16,
+                "spatial_merge_size": 2, "temporal_patch_size": 2,
+                "rms_norm_eps": 1e-5, "attention_bias": true,
+                "attention_dropout": 0.0, "hidden_act": "silu",
+                "swiglu_limit": 10.0, "initializer_range": 0.02
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Add the `model.visual.*` weights for `reduced_vision_config()` to `m`.
+    fn build_vision_weights(
+        m: &mut HashMap<String, Tensor>,
+        dev: &Device,
+        r: &mut impl FnMut() -> f32,
+    ) {
+        let cfg = reduced_vision_config();
+        let h = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let out = cfg.out_hidden_size;
+        let ctx = cfg.projection_intermediate_size;
+        let hd = h / cfg.num_heads;
+        let sm = cfg.spatial_merge_size;
+        let p = cfg.patch_size;
+        let tps = cfg.temporal_patch_size;
+        let inc = cfg.in_channels;
+
+        put(
+            m,
+            "model.visual.patch_embed.proj.weight",
+            &[h, inc, tps, p, p],
+            dev,
+            r,
+        );
+        put(m, "model.visual.patch_embed.proj.bias", &[h], dev, r);
+        for i in 0..cfg.depth {
+            let pfx = format!("model.visual.blocks.{i}");
+            put(m, &format!("{pfx}.norm1.weight"), &[h], dev, r);
+            put(m, &format!("{pfx}.norm2.weight"), &[h], dev, r);
+            put(m, &format!("{pfx}.attn.qkv.weight"), &[3 * h, h], dev, r);
+            put(m, &format!("{pfx}.attn.qkv.bias"), &[3 * h], dev, r);
+            put(m, &format!("{pfx}.attn.q_norm.weight"), &[hd], dev, r);
+            put(m, &format!("{pfx}.attn.k_norm.weight"), &[hd], dev, r);
+            put(m, &format!("{pfx}.attn.proj.weight"), &[h, h], dev, r);
+            put(m, &format!("{pfx}.attn.proj.bias"), &[h], dev, r);
+            put(
+                m,
+                &format!("{pfx}.mlp.gate_proj.weight"),
+                &[inter, h],
+                dev,
+                r,
+            );
+            put(m, &format!("{pfx}.mlp.gate_proj.bias"), &[inter], dev, r);
+            put(m, &format!("{pfx}.mlp.up_proj.weight"), &[inter, h], dev, r);
+            put(m, &format!("{pfx}.mlp.up_proj.bias"), &[inter], dev, r);
+            put(
+                m,
+                &format!("{pfx}.mlp.down_proj.weight"),
+                &[h, inter],
+                dev,
+                r,
+            );
+            put(m, &format!("{pfx}.mlp.down_proj.bias"), &[h], dev, r);
+        }
+        put(m, "model.visual.post_layernorm.weight", &[h], dev, r);
+        put(
+            m,
+            "model.visual.downsample.weight",
+            &[out, h, sm, sm],
+            dev,
+            r,
+        );
+        put(m, "model.visual.downsample.bias", &[out], dev, r);
+        put(m, "model.visual.merger.proj.weight", &[out, out], dev, r);
+        put(
+            m,
+            "model.visual.merger.post_projection_norm.weight",
+            &[out],
+            dev,
+            r,
+        );
+        put(
+            m,
+            "model.visual.merger.post_projection_norm.bias",
+            &[out],
+            dev,
+            r,
+        );
+        put(
+            m,
+            "model.visual.merger.gate_proj.weight",
+            &[ctx, out],
+            dev,
+            r,
+        );
+        put(m, "model.visual.merger.up_proj.weight", &[ctx, out], dev, r);
+        put(
+            m,
+            "model.visual.merger.down_proj.weight",
+            &[out, ctx],
+            dev,
+            r,
+        );
+    }
+
+    fn build_vision_weights_full() -> HashMap<String, Tensor> {
+        let dev = Device::Cpu;
+        let text_cfg = reduced_config();
+        let mut r = rng_seq();
+        let mut m = build_weights(&text_cfg, &dev);
+        build_vision_weights(&mut m, &dev, &mut r);
+        m
+    }
+
+    /// Vision tower builds from official `model.visual.*` weight names and
+    /// produces the expected merged-embedding shape for one image (story #5889).
+    #[test]
+    fn vision_tower_builds_and_embeds() {
+        let dev = Device::Cpu;
+        let weights = build_vision_weights_full();
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &dev);
+        let cfg = reduced_vision_config();
+        let model =
+            crate::models::glm5_next::vision::Glm5NextVisionModel::new(&cfg, vb.pp("model.visual"))
+                .unwrap();
+
+        // One image: image_size 4, patch_size 2 -> grid 2x2 -> 4 patches, patch_dim=8.
+        let pixel_values =
+            Tensor::new(&[[[1.0f32; 8], [2.0; 8], [3.0; 8], [4.0; 8]]], &dev).unwrap(); // [1, 4, 8]
+        let grid_thw = Tensor::new(&[[1i64, 2, 2]], &dev).unwrap(); // [1, 3]
+        let out = model.forward(&pixel_values, &grid_thw).unwrap();
+        // 4 patches / (spatial_merge_size^2 = 4) = 1 merged token of out_hidden_size.
+        assert_eq!(out.dims(), &[1, cfg.out_hidden_size]);
+    }
+
+    /// The multimodal forward injects vision embeddings at `image_token_id`
+    /// positions and returns logits without a shape error (story #5889).
+    #[test]
+    fn multimodal_forward_injects_image_tokens() {
+        let dev = Device::Cpu;
+        let text_cfg = reduced_config();
+        let image_token_id = 500usize;
+        let weights = build_vision_weights_full();
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &dev);
+        let vision_cfg = reduced_vision_config();
+        let mut model = crate::models::glm5_next::model::Glm5NextForCausalLM::new_vision(
+            &text_cfg,
+            &vision_cfg,
+            image_token_id,
+            vb,
+        )
+        .unwrap();
+
+        // One image token in the middle of a short prompt.
+        let ids = Tensor::new(&[[1u32, 2, image_token_id as u32, 3]], &dev).unwrap(); // [1, 4]
+        let pixel_values =
+            Tensor::new(&[[[1.0f32; 8], [2.0; 8], [3.0; 8], [4.0; 8]]], &dev).unwrap();
+        let grid_thw = Tensor::new(&[[1i64, 2, 2]], &dev).unwrap();
+        let logits = model
+            .forward_vision(&ids, Some(&pixel_values), Some(&grid_thw), 0)
+            .unwrap();
+        assert_eq!(logits.dims(), &[1, 4, text_cfg.vocab_size]);
+
+        // The image-token position must differ from the plain (un-injected)
+        // text embedding for the same token, proving the injection took effect.
+        let mut plain = build_model(&text_cfg, &dev);
+        let plain_ids = Tensor::new(&[[1u32, 2, 500, 3]], &dev).unwrap();
+        let plain_logits = plain.forward(&plain_ids, 0).unwrap();
+        let a = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = plain_logits
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-4),
+            "image-token injection had no effect on logits"
+        );
+    }
+
+    /// Multimodal forward without pixel input (or without a vision config)
+    /// falls back to the text-only path (story #5889).
+    #[test]
+    fn multimodal_forward_falls_back_without_pixels() {
+        let dev = Device::Cpu;
+        let text_cfg = reduced_config();
+        let weights = build_vision_weights_full();
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &dev);
+        let vision_cfg = reduced_vision_config();
+        let mut model = crate::models::glm5_next::model::Glm5NextForCausalLM::new_vision(
+            &text_cfg,
+            &vision_cfg,
+            500,
+            vb,
+        )
+        .unwrap();
+        let ids = Tensor::new(&[[1u32, 2, 3, 4]], &dev).unwrap();
+        let logits = model.forward_vision(&ids, None, None, 0).unwrap();
+        assert_eq!(logits.dims(), &[1, 4, text_cfg.vocab_size]);
     }
 }

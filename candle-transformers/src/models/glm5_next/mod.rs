@@ -21,6 +21,9 @@ pub mod kda;
 /// Text-only GLM-5.3-Flash causal LM assembly (story #4355).
 pub mod model;
 
+/// GLM-5.3-Flash vision tower (story #5889).
+pub mod vision;
+
 serde_default_fn!(usize, default_num_key_value_heads, 64);
 serde_default_fn!(usize, default_n_shared_experts, 1);
 serde_default_fn!(f64, default_routed_scaling_factor, 1.0);
