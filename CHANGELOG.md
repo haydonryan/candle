@@ -21,6 +21,9 @@ This documents the main changes to the `candle` crate.
 
 ### Modified
 
+- `glm5_next`: make the DSA indexer's k-pool gate projection batch-broadcastable
+  (`broadcast_matmul`), so a B>1 prefill and B>1 cached decode both run and each
+  batch element matches its B=1 reference (story #5888).
 - `deepseek_v4`: load the hash router's `tid2eid` table as `I64` (fixes loading
   real HF checkpoints on CUDA), and run hyper-connection / hyper-head collapse
   in the hidden-state dtype (fixes dtype mismatches with bf16 checkpoints).
