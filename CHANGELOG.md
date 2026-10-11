@@ -21,6 +21,11 @@ This documents the main changes to the `candle` crate.
 
 ### Modified
 
+- `glm5_next`: add a multimodal vision tower (`glm5_next::vision::Glm5NextVisionModel`,
+  the `model.visual.*` patch-embed / transformer-blocks / downsample / merger encoder)
+  and wire it into `Glm5NextForCausalLM` (`new_vision` + `forward_vision`) so image
+  token positions are replaced with vision embeddings before the text transformer
+  (story #5889).
 - `glm5_next`: make the DSA indexer's k-pool gate projection batch-broadcastable
   (`broadcast_matmul`), so a B>1 prefill and B>1 cached decode both run and each
   batch element matches its B=1 reference (story #5888).
