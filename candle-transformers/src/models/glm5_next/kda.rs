@@ -109,14 +109,26 @@ struct KdaForgetGate {
 }
 
 impl KdaForgetGate {
+    /// `vb` is the `self_attn`-level var builder. Supports both the nested
+    /// `forget_gate.{f_a_proj,f_b_proj,dt_bias,A_log}` layout (older / synthetic
+    /// checkpoints and the unit tests) and the flat `self_attn.{f_a_proj,
+    /// f_b_proj,dt_bias,A_log}` layout used by the real GLM-5.3-Flash
+    /// checkpoint.
     fn new(cfg: &impl KdaConfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.linear_head_dim();
         let num_heads = cfg.linear_num_heads();
         let qkv_dim = head_dim * num_heads;
-        let f_a_proj = linear_no_bias(cfg.hidden_size(), head_dim, vb.pp("f_a_proj"))?;
-        let f_b_proj = linear_no_bias(head_dim, qkv_dim, vb.pp("f_b_proj"))?;
-        let dt_bias = vb.get((qkv_dim,), "dt_bias")?;
-        let a_log = vb.get((num_heads,), "A_log")?;
+        // Prefer the nested form; fall back to the flat form.
+        let (gvb, flat) = if vb.contains_tensor("forget_gate.f_a_proj.weight") {
+            (vb.pp("forget_gate"), false)
+        } else {
+            (vb.clone(), true)
+        };
+        let f_a_proj = linear_no_bias(cfg.hidden_size(), head_dim, gvb.pp("f_a_proj"))?;
+        let f_b_proj = linear_no_bias(head_dim, qkv_dim, gvb.pp("f_b_proj"))?;
+        let dt_bias = gvb.get((qkv_dim,), "dt_bias")?;
+        let a_log = gvb.get((num_heads,), "A_log")?;
+        let _ = flat;
         Ok(Self {
             f_a_proj,
             f_b_proj,
@@ -301,7 +313,7 @@ impl KdaLinearAttention {
             let v = vb.get((qkv_dim, 1, conv_kernel), "v_conv1d.weight")?;
             Tensor::cat(&[q, k, v], 0)?
         };
-        let forget_gate = KdaForgetGate::new(cfg, vb.pp("forget_gate"))?;
+        let forget_gate = KdaForgetGate::new(cfg, vb.clone())?;
         let b_proj = linear_no_bias(hidden_size, num_heads, vb.pp("b_proj"))?;
         let g_a_proj = linear_no_bias(hidden_size, head_dim, vb.pp("g_a_proj"))?;
         let g_b_proj = linear_no_bias(head_dim, qkv_dim, vb.pp("g_b_proj"))?;
@@ -667,6 +679,90 @@ mod tests {
         assert_eq!(split_w.len(), CONV_DIM * KERNEL);
         for (a, b) in single_w.iter().zip(split_w.iter()) {
             assert!((a - b).abs() < 1e-6, "conv weight mismatch: {a} vs {b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flat_forget_gate_matches_nested() -> candle::Result<()> {
+        // The real GLM-5.3-Flash checkpoint stores forget-gate weights flat at
+        // the self_attn level (no `forget_gate.` nesting). Build the block from
+        // the flat layout and assert the forget-gate projection weights match
+        // the nested layout used by the existing tests.
+        let dev = Device::Cpu;
+        let ws = gen_weights();
+        let nested = build_block(&ws, &dev)?;
+
+        let mut tensors = HashMap::new();
+        let put = |t: &mut HashMap<String, Tensor>, name: &str, data: &[f32]| {
+            let shp: candle::Shape = match name {
+                "q_proj.weight" | "k_proj.weight" | "v_proj.weight" => (QKVD, HIDDEN).into(),
+                "conv1d.weight" => (CONV_DIM, 1, KERNEL).into(),
+                // Flat forget-gate keys live directly at the self_attn level.
+                "f_a_proj.weight" | "g_a_proj.weight" => (HEAD_DIM, HIDDEN).into(),
+                "f_b_proj.weight" | "g_b_proj.weight" => (QKVD, HEAD_DIM).into(),
+                "dt_bias" => (QKVD,).into(),
+                "A_log" => (HEADS,).into(),
+                "b_proj.weight" => (HEADS, HIDDEN).into(),
+                "o_norm.weight" => (HEAD_DIM,).into(),
+                "o_proj.weight" => (HIDDEN, QKVD).into(),
+                _ => unreachable!(),
+            };
+            t.insert(
+                name.to_string(),
+                Tensor::from_vec(data.to_vec(), shp, &dev).unwrap(),
+            );
+        };
+        put(&mut tensors, "q_proj.weight", &ws.q);
+        put(&mut tensors, "k_proj.weight", &ws.k);
+        put(&mut tensors, "v_proj.weight", &ws.v);
+        put(&mut tensors, "conv1d.weight", &ws.conv);
+        put(&mut tensors, "f_a_proj.weight", &ws.f_a);
+        put(&mut tensors, "f_b_proj.weight", &ws.f_b);
+        put(&mut tensors, "dt_bias", &ws.dt_bias);
+        put(&mut tensors, "A_log", &ws.a_log);
+        put(&mut tensors, "b_proj.weight", &ws.b);
+        put(&mut tensors, "g_a_proj.weight", &ws.g_a);
+        put(&mut tensors, "g_b_proj.weight", &ws.g_b);
+        put(&mut tensors, "o_norm.weight", &ws.o_norm);
+        put(&mut tensors, "o_proj.weight", &ws.o);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+        let flat = KdaLinearAttention::new(&cfg(), 0, vb)?;
+
+        // Forget-gate weights must be identical between the two layouts.
+        for (a, b) in nested
+            .forget_gate
+            .f_a_proj
+            .weight()
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .zip(
+                flat.forget_gate
+                    .f_a_proj
+                    .weight()
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            )
+        {
+            assert!((a - b).abs() < 1e-6, "f_a_proj mismatch: {a} vs {b}");
+        }
+        for (a, b) in nested
+            .forget_gate
+            .f_b_proj
+            .weight()
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .zip(
+                flat.forget_gate
+                    .f_b_proj
+                    .weight()
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            )
+        {
+            assert!((a - b).abs() < 1e-6, "f_b_proj mismatch: {a} vs {b}");
         }
         Ok(())
     }
