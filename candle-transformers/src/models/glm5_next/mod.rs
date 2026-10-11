@@ -373,6 +373,7 @@ mod tests {
     use candle::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// A reduced, official-shaped `glm5_next_text` config: real field names and
     /// the nested `linear_attn_config`, but tiny sizes so it fits a unit test.
@@ -471,5 +472,53 @@ mod tests {
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
         let _comp = DeepseekV4HyperConnection::new(&cfg, vb)?;
         Ok(())
+    }
+
+    fn sample_config_path() -> PathBuf {
+        let candidates = [
+            "sample_models/glm-5.3-flash-tiny/config.json",
+            "../sample_models/glm-5.3-flash-tiny/config.json",
+        ];
+        for c in candidates {
+            let p = PathBuf::from(c);
+            if p.exists() {
+                return p;
+            }
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../sample_models/glm-5.3-flash-tiny/config.json")
+    }
+
+    /// The on-disk `sample_models/glm-5.3-flash-tiny/config.json` fixture loads
+    /// through the `glm5_next_text` deserializer. Mirrors the deepseek-v4-tiny
+    /// fixture contract so the example's default `--model-dir` resolves.
+    #[test]
+    fn tiny_fixture_config_deserializes() {
+        let path = sample_config_path();
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let cfg: Glm5NextTextConfig = serde_json::from_str(&raw).unwrap();
+
+        // Core fields match the fixture (and reduced_config()).
+        assert_eq!(cfg.vocab_size, 1024);
+        assert_eq!(cfg.hidden_size, 32);
+        assert_eq!(cfg.intermediate_size, 64);
+        assert_eq!(cfg.moe_intermediate_size, 16);
+        assert_eq!(cfg.num_hidden_layers, 8);
+        assert_eq!(cfg.num_attention_heads, 4);
+        assert_eq!(cfg.n_routed_experts, 8);
+        assert_eq!(cfg.qk_rope_head_dim, 0);
+        assert_eq!(cfg.linear_attn_config.num_heads, 2);
+        assert_eq!(cfg.linear_head_dim(), 8);
+
+        // The fixture omits layer_types/mlp_layer_types/indexer_types, so the
+        // schedule defaults must resolve.
+        let attn = cfg.effective_layer_types();
+        assert_eq!(attn.len(), 8);
+        assert_eq!(attn[3], LayerType::DeepseekSparseAttention);
+        assert_eq!(cfg.dsa_layer_indices(), vec![3, 7]);
+        let mlp = cfg.effective_mlp_layer_types();
+        assert_eq!(mlp[0], MlpLayerType::Dense);
+        assert_eq!(mlp[2], MlpLayerType::Sparse);
     }
 }
