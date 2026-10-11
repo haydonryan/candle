@@ -302,7 +302,7 @@ impl Glm5NextTextIndexer {
             .k_norm
             .forward(&self.wk.forward(hidden_states)?)?
             .reshape((batch, seq, hd))?;
-        let gate_scores = hidden_states.matmul(&self.gate.t()?.unsqueeze(0)?)?; // [B, S, hd]
+        let gate_scores = hidden_states.broadcast_matmul(&self.gate.t()?.unsqueeze(0)?)?; // [B, S, hd]
         let packed = Tensor::cat(&[&kk, &gate_scores, &valid_channel], D::Minus1)?;
 
         // Accumulate across calls so cached decode selects over the full context.
@@ -1529,5 +1529,96 @@ mod tests {
             (tok as usize) < cfg.vocab_size,
             "sampled token {tok} out of vocab range"
         );
+    }
+
+    fn close_vec(a: &[f32], b: &[f32], tol: f32, label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+        for i in 0..a.len() {
+            let d = (a[i] - b[i]).abs();
+            assert!(
+                d <= tol,
+                "{label}: mismatch at {i}: batched={} single={} (diff {})",
+                a[i],
+                b[i],
+                d
+            );
+        }
+    }
+
+    /// B>1 batch-broadcasting: a batched prefill forward must equal running the
+    /// same sequence through a fresh B=1 model, per batch element. This is the
+    /// regression test for story #5888 (the DSA indexer's gate projection did
+    /// not broadcast the batch dim).
+    #[test]
+    fn batched_prefill_matches_per_batch_single() {
+        let cfg = reduced_config();
+        let dev = Device::Cpu;
+        let ids = Tensor::new(
+            &[
+                [1u32, 2, 3, 4, 5],
+                [6u32, 7, 8, 9, 10],
+                [11u32, 12, 13, 14, 15],
+            ],
+            &dev,
+        )
+        .unwrap(); // [B=3, S=5]
+
+        let mut batched = build_model(&cfg, &dev);
+        let batched_logits = batched.forward(&ids, 0).unwrap(); // [3, 5, vocab]
+
+        // Compare each batch row against a fresh B=1 model on the same ids.
+        for b in 0..3 {
+            let row = ids.narrow(0, b, 1).unwrap();
+            let mut single = build_model(&cfg, &dev);
+            let single_logits = single.forward(&row, 0).unwrap(); // [1, 5, vocab]
+            let bv = batched_logits
+                .narrow(0, b, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let sv = single_logits
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            close_vec(&bv, &sv, 1e-4, &format!("prefill batch row {b}"));
+        }
+    }
+
+    /// B>1 cached decode: after a batched prefill, decoding one more token per
+    /// batch element must match a fresh B=1 prefill+decode on the same row.
+    #[test]
+    fn batched_decode_matches_per_batch_single() {
+        let cfg = reduced_config();
+        let dev = Device::Cpu;
+        let pre_ids = Tensor::new(
+            &[[1u32, 2, 3, 4], [6u32, 7, 8, 9], [11u32, 12, 13, 14]],
+            &dev,
+        )
+        .unwrap(); // [3, 4]
+        let next_ids = Tensor::new(&[[5u32], [10u32], [15u32]], &dev).unwrap(); // [3, 1]
+
+        let mut batched = build_model(&cfg, &dev);
+        let _ = batched.forward(&pre_ids, 0).unwrap();
+        let batched_dec = batched.forward(&next_ids, 4).unwrap(); // [3, 1, vocab]
+
+        for b in 0..3 {
+            let pre_row = pre_ids.narrow(0, b, 1).unwrap();
+            let next_row = next_ids.narrow(0, b, 1).unwrap();
+            let mut single = build_model(&cfg, &dev);
+            let _ = single.forward(&pre_row, 0).unwrap();
+            let single_dec = single.forward(&next_row, 4).unwrap(); // [1, 1, vocab]
+            let bv = batched_dec
+                .narrow(0, b, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let sv = single_dec.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            close_vec(&bv, &sv, 1e-4, &format!("decode batch row {b}"));
+        }
     }
 }
