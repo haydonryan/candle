@@ -523,6 +523,15 @@ impl Glm5NextTextIndexer {
             .filter(|(_, &v)| v != 0)
             .map(|(i, _)| i as u32)
             .collect();
+        // GPU index_select cannot launch a zero-element grid. Return the
+        // empty pool contract directly, including fully masked batch rows.
+        if keep_idx.is_empty() {
+            return Ok((
+                Tensor::zeros((batch, 0, hd), pool_keys.dtype(), dev)?,
+                Tensor::zeros((batch, 0, k), pool_indices.dtype(), dev)?,
+                Tensor::zeros((batch, 0), pool_valid.dtype(), dev)?,
+            ));
+        }
         let keep_t = Tensor::new(keep_idx.as_slice(), dev)?;
         let pool_keys = pool_keys.index_select(&keep_t, 1)?;
         let pool_indices = pool_indices.index_select(&keep_t, 1)?;
