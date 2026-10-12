@@ -1712,7 +1712,11 @@ mod tests {
                 .unwrap()
                 .to_vec3::<i64>()
                 .unwrap();
-            for position in 0..6 {
+            assert_eq!(expected.len(), hidden.dim(0).unwrap());
+            for rows in &expected {
+                assert_eq!(rows.len(), hidden.dim(1).unwrap());
+            }
+            for (position, _) in expected[0].iter().enumerate() {
                 let result = indexer
                     .forward(
                         &hidden.narrow(1, position, 1).unwrap(),
@@ -1722,7 +1726,8 @@ mod tests {
                     .unwrap()
                     .to_vec3::<i64>()
                     .unwrap();
-                for batch in 0..2 {
+                assert_eq!(result.len(), expected.len());
+                for (result_row, expected_rows) in result.iter().zip(&expected) {
                     let valid = |ids: &[i64]| {
                         let mut values: Vec<_> =
                             ids.iter().copied().filter(|id| *id >= 0).collect();
@@ -1731,7 +1736,7 @@ mod tests {
                     };
                     // Empty slots occupy different positions before pools form;
                     // the selected token set must stay exactly causal.
-                    assert_eq!(valid(&result[batch][0]), valid(&expected[batch][position]));
+                    assert_eq!(valid(&result_row[0]), valid(&expected_rows[position]));
                 }
                 assert_eq!(
                     indexer.packed_cache.as_ref().unwrap().dim(1).unwrap(),
