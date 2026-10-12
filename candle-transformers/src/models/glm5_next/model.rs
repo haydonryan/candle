@@ -745,7 +745,10 @@ impl Glm5NextTextAttention {
             .sum_keepdim(D::Minus1)?
             .gt(0f32)?
             .broadcast_as(att.shape())?;
-        let att = selected.where_cond(&att, &att.zeros_like()?)?;
+        let att = selected.where_cond(
+            &att,
+            &Tensor::new(0f32, att.device())?.broadcast_as(att.shape())?,
+        )?;
         let attn_out = att.matmul(&vf)?.to_dtype(dtype)?; // [B, H, S, v_head]
 
         let out = attn_out.transpose(1, 2)?.contiguous()?.reshape((
@@ -1717,6 +1720,8 @@ mod tests {
                         values.sort();
                         values
                     };
+                    // Empty slots occupy different positions before pools form;
+                    // the selected token set must stay exactly causal.
                     assert_eq!(valid(&result[batch][0]), valid(&expected[batch][position]));
                 }
                 assert_eq!(
