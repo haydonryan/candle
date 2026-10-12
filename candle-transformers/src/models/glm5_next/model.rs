@@ -334,68 +334,75 @@ impl Glm5NextTextIndexer {
         let (pool_keys, pool_indices, pool_valid) = self.get_pooled_states(&packed)?;
         let n_pools = pool_keys.dim(1)?;
 
-        // Score across pools (not per token).
-        let scores = q
-            .to_dtype(DType::F32)?
-            .broadcast_matmul(&pool_keys.t()?.unsqueeze(1)?)?;
-        let scores = (scores * self.softmax_scale)?.clamp(0.0, f32::MAX)?; // [B, S, n_heads, n_pools]
+        // An incomplete prefix has no complete pools. Keep its projected
+        // packed cache for later calls, but do not narrow/gather zero-width
+        // pool views: their nonzero offsets are undefined in Candle backends.
+        let mut topk_indices = if n_pools == 0 {
+            Tensor::zeros((batch, seq, 0), DType::I64, dev)?
+        } else {
+            // Score across pools (not per token).
+            let scores = q
+                .to_dtype(DType::F32)?
+                .broadcast_matmul(&pool_keys.t()?.unsqueeze(1)?)?;
+            let scores = (scores * self.softmax_scale)?.clamp(0.0, f32::MAX)?; // [B, S, n_heads, n_pools]
 
-        let weights = (self
-            .weights_proj
-            .forward(hidden_states)?
-            .to_dtype(DType::F32)?
-            * (self.num_heads as f64).powf(-0.5))?; // [B, S, n_heads]
-        let index_scores = weights
-            .unsqueeze(D::Minus2)?
-            .broadcast_matmul(&scores)?
-            .squeeze(D::Minus2)?; // [B, S, n_pools]
+            let weights = (self
+                .weights_proj
+                .forward(hidden_states)?
+                .to_dtype(DType::F32)?
+                * (self.num_heads as f64).powf(-0.5))?; // [B, S, n_heads]
+            let index_scores = weights
+                .unsqueeze(D::Minus2)?
+                .broadcast_matmul(&scores)?
+                .squeeze(D::Minus2)?; // [B, S, n_pools]
 
-        // A pool is selectable only if its final token is visible to the query.
-        let pool_end = pool_indices
-            .narrow(D::Minus1, k - 1, 1)?
-            .squeeze(D::Minus1)?
-            .clamp(0, (kv_len - 1) as i64)?; // [B, n_pools]
-        let pool_visible = visible_tokens.contiguous()?.gather(
-            &pool_end
-                .unsqueeze(1)?
-                .broadcast_as((batch, seq, n_pools))?
-                .contiguous()?,
-            D::Minus1,
-        )?; // [B, S, n_pools]
-        let valid_candidates = bool_and(&pool_visible, &pool_valid.unsqueeze(1)?)?;
+            // A pool is selectable only if its final token is visible to the query.
+            let pool_end = pool_indices
+                .narrow(D::Minus1, k - 1, 1)?
+                .squeeze(D::Minus1)?
+                .clamp(0, (kv_len - 1) as i64)?; // [B, n_pools]
+            let pool_visible = visible_tokens.contiguous()?.gather(
+                &pool_end
+                    .unsqueeze(1)?
+                    .broadcast_as((batch, seq, n_pools))?
+                    .contiguous()?,
+                D::Minus1,
+            )?; // [B, S, n_pools]
+            let valid_candidates = bool_and(&pool_visible, &pool_valid.unsqueeze(1)?)?;
 
-        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq, n_pools), dev)?;
-        let index_scores = valid_candidates.where_cond(&index_scores, &neg_inf)?;
+            let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch, seq, n_pools), dev)?;
+            let index_scores = valid_candidates.where_cond(&index_scores, &neg_inf)?;
 
-        let select_k = self.index_topk / k;
-        let select_k = select_k.min(n_pools);
-        let (_, selected) = topk_last_dim_values(&index_scores, select_k)?; // [B, S, select_k]
+            let select_k = self.index_topk / k;
+            let select_k = select_k.min(n_pools);
+            let (_, selected) = topk_last_dim_values(&index_scores, select_k)?; // [B, S, select_k]
 
-        let selected_valid = valid_candidates
-            .contiguous()?
-            .gather(&selected, D::Minus1)?; // [B, S, select_k]
+            let selected_valid = valid_candidates
+                .contiguous()?
+                .gather(&selected, D::Minus1)?; // [B, S, select_k]
 
-        // Gather the raw token indices of each selected pool into
-        // [B, S, select_k*K] via flat indexing over the [B, P*K] pool rows.
-        let pk = pool_indices.reshape((batch, n_pools * k))?.contiguous()?;
-        let k_off = Tensor::arange(0i64, k as i64, dev)?.reshape((1, 1, 1, k))?;
-        let flat_idx = selected
-            .unsqueeze(D::Minus1)?
-            .to_dtype(DType::I64)?
-            .broadcast_mul(&Tensor::full(k as i64, (batch, seq, select_k, 1), dev)?)?
-            .broadcast_add(&k_off)?
-            .reshape((batch, seq * select_k * k))?
-            .contiguous()?;
-        let gathered = pk.gather(&flat_idx, 1)?; // [B, seq*select_k*K]
-        let mut topk_indices = gathered.reshape((batch, seq, select_k * k))?; // [B,S,select_k*K]
+            // Gather the raw token indices of each selected pool into
+            // [B, S, select_k*K] via flat indexing over the [B, P*K] pool rows.
+            let pk = pool_indices.reshape((batch, n_pools * k))?.contiguous()?;
+            let k_off = Tensor::arange(0i64, k as i64, dev)?.reshape((1, 1, 1, k))?;
+            let flat_idx = selected
+                .unsqueeze(D::Minus1)?
+                .to_dtype(DType::I64)?
+                .broadcast_mul(&Tensor::full(k as i64, (batch, seq, select_k, 1), dev)?)?
+                .broadcast_add(&k_off)?
+                .reshape((batch, seq * select_k * k))?
+                .contiguous()?;
+            let gathered = pk.gather(&flat_idx, 1)?; // [B, seq*select_k*K]
+            let topk_indices = gathered.reshape((batch, seq, select_k * k))?; // [B,S,select_k*K]
 
-        // Mask invalid pool selections to -1.
-        let neg1 = Tensor::full(-1i64, (batch, seq, select_k * k), dev)?;
-        let valid_b = selected_valid
-            .unsqueeze(D::Minus1)?
-            .broadcast_as((batch, seq, select_k, k))?
-            .reshape((batch, seq, select_k * k))?;
-        topk_indices = valid_b.where_cond(&topk_indices, &neg1)?;
+            // Mask invalid pool selections to -1.
+            let neg1 = Tensor::full(-1i64, (batch, seq, select_k * k), dev)?;
+            let valid_b = selected_valid
+                .unsqueeze(D::Minus1)?
+                .broadcast_as((batch, seq, select_k, k))?
+                .reshape((batch, seq, select_k * k))?;
+            valid_b.where_cond(&topk_indices, &neg1)?
+        };
 
         let mut output_width = self.index_topk;
         if self.always_select_tail {
@@ -730,6 +737,15 @@ impl Glm5NextTextAttention {
         let att = (qf.matmul(&kf.t()?)? * self.scaling)?;
         let att = att.broadcast_add(&mask)?;
         let att = candle_nn::ops::softmax_last_dim(&att)?;
+        // SDPA safe-softmax semantics: no selected key means zero attention,
+        // rather than NaNs or uniform attention to unselected/future keys.
+        let selected = mask
+            .eq(0f32)?
+            .to_dtype(DType::F32)?
+            .sum_keepdim(D::Minus1)?
+            .gt(0f32)?
+            .broadcast_as(att.shape())?;
+        let att = selected.where_cond(&att, &att.zeros_like()?)?;
         let attn_out = att.matmul(&vf)?.to_dtype(dtype)?; // [B, H, S, v_head]
 
         let out = attn_out.transpose(1, 2)?.contiguous()?.reshape((
@@ -766,7 +782,9 @@ impl Glm5NextTextAttention {
         )?;
         let mask_bool = counts.ne(0i64)?.unsqueeze(1)?; // [B,1,S,kv_len]
         let zeros = Tensor::zeros((bs, 1, seq, kv_len), DType::F32, dev)?;
-        let neg_inf = Tensor::full(f32::NEG_INFINITY, (bs, 1, seq, kv_len), dev)?;
+        // The reference eager path uses finfo(query.dtype).min, keeping
+        // short no-tail prefixes finite even when every selection is invalid.
+        let neg_inf = Tensor::full(f32::MIN, (bs, 1, seq, kv_len), dev)?;
         mask_bool.where_cond(&zeros, &neg_inf)
     }
 }
@@ -1639,6 +1657,137 @@ mod tests {
                 b[i],
                 d
             );
+        }
+    }
+
+    #[test]
+    fn empty_pool_prefix_keeps_cache_and_selects_only_visible_tail() {
+        let dev = Device::Cpu;
+        for tail in [true, false] {
+            let mut cfg = reduced_config();
+            cfg.index_kpool = 4;
+            cfg.index_kpool_always_select_tail = tail;
+            let weights = build_weights(&cfg, &dev);
+            let vb = VarBuilder::from_tensors(weights, DType::F32, &dev)
+                .pp("model.layers.3.self_attn.indexer");
+            let mut indexer = Glm5NextTextIndexer::new(&cfg, vb).unwrap();
+            let mut r = rng_seq();
+            let hidden = Tensor::from_vec(
+                (0..2 * 6 * cfg.hidden_size).map(|_| r()).collect(),
+                (2, 6, cfg.hidden_size),
+                &dev,
+            )
+            .unwrap();
+            let query = Tensor::from_vec(
+                (0..2 * 6 * cfg.q_lora_rank).map(|_| r()).collect(),
+                (2, 6, cfg.q_lora_rank),
+                &dev,
+            )
+            .unwrap();
+            let mask = Tensor::new(
+                &[[1f32, 1., 1., 1., 1., 1.], [0., 1., 1., 1., 1., 1.]],
+                &dev,
+            )
+            .unwrap();
+            let mut full = Glm5NextTextIndexer::new(
+                &cfg,
+                VarBuilder::from_tensors(build_weights(&cfg, &dev), DType::F32, &dev)
+                    .pp("model.layers.3.self_attn.indexer"),
+            )
+            .unwrap();
+            let expected = full
+                .forward(&hidden, &query, Some(&mask))
+                .unwrap()
+                .to_vec3::<i64>()
+                .unwrap();
+            for position in 0..6 {
+                let result = indexer
+                    .forward(
+                        &hidden.narrow(1, position, 1).unwrap(),
+                        &query.narrow(1, position, 1).unwrap(),
+                        Some(&mask.narrow(1, position, 1).unwrap()),
+                    )
+                    .unwrap()
+                    .to_vec3::<i64>()
+                    .unwrap();
+                for batch in 0..2 {
+                    let valid = |ids: &[i64]| {
+                        let mut values: Vec<_> =
+                            ids.iter().copied().filter(|id| *id >= 0).collect();
+                        values.sort();
+                        values
+                    };
+                    assert_eq!(valid(&result[batch][0]), valid(&expected[batch][position]));
+                }
+                assert_eq!(
+                    indexer.packed_cache.as_ref().unwrap().dim(1).unwrap(),
+                    position + 1
+                );
+                if position == 0 {
+                    assert!(result[1][0].iter().all(|id| *id == -1));
+                    assert_eq!(result[0][0][0], if tail { 0 } else { -1 });
+                }
+            }
+            indexer.clear_cache();
+            assert!(indexer.packed_cache.is_none());
+        }
+    }
+
+    #[test]
+    fn one_token_prefill_matches_full_causal_rows_and_recovers_cache() {
+        for tail in [true, false] {
+            let mut cfg = reduced_config();
+            cfg.index_kpool_always_select_tail = tail;
+            cfg.linear_attn_config.short_conv_kernel_size = 4;
+            let dev = Device::Cpu;
+            let ids = Tensor::new(&[[1u32, 2, 3, 4, 5, 6, 7, 8, 9]], &dev).unwrap();
+            let mut full = build_model(&cfg, &dev);
+            let expected = full.forward(&ids, 0).unwrap();
+            for chunk in [1usize, 2, 3] {
+                let mut incremental = build_model(&cfg, &dev);
+                let first = incremental
+                    .forward(&ids.narrow(1, 0, 1).unwrap(), 0)
+                    .unwrap();
+                let mut rows = vec![first];
+                let mut position = 1;
+                while position < 9 {
+                    let width = chunk.min(9 - position);
+                    rows.push(
+                        incremental
+                            .forward(&ids.narrow(1, position, width).unwrap(), position)
+                            .unwrap(),
+                    );
+                    position += width;
+                }
+                let actual = Tensor::cat(&rows, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                close_vec(
+                    &expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    &actual,
+                    1e-4,
+                    "one-token prefix causal rows",
+                );
+                assert!(actual.iter().all(|value| value.is_finite()));
+                assert!(actual.iter().any(|value| value.abs() > 1e-4));
+                incremental.clear_kv_cache();
+                let reset = incremental
+                    .forward(&ids.narrow(1, 0, 1).unwrap(), 0)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                close_vec(
+                    &rows[0].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    &reset,
+                    1e-4,
+                    "request reset",
+                );
+            }
         }
     }
 

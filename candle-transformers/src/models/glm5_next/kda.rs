@@ -233,11 +233,23 @@ fn causal_conv1d(
     take_last: bool,
 ) -> Result<Tensor> {
     let out = x.conv1d_with_algo(weight, conv_kernel - 1, 1, 1, conv_dim, None)?;
-    let len = out.dim(2)?;
     if take_last {
-        out.narrow(2, len - t, t)
+        // Right-padding outputs are not causal continuation positions.
+        out.narrow(2, x.dim(2)? - t, t)
     } else {
         out.narrow(2, 0, t)
+    }
+}
+
+/// Keep exactly the causal history, including zero history before a short prefix.
+fn causal_conv_state(x: &Tensor, kernel: usize) -> Result<Tensor> {
+    let (batch, channels, len) = x.dims3()?;
+    let history = kernel - 1;
+    if len >= history {
+        x.narrow(2, len - history, history)
+    } else {
+        let zeros = Tensor::zeros((batch, channels, history - len), x.dtype(), x.device())?;
+        Tensor::cat(&[&zeros, x], 2)
     }
 }
 
@@ -417,8 +429,7 @@ impl KdaLinearAttention {
                 seq_len,
                 false,
             )?;
-            self.conv_state =
-                Some(mixed.narrow(2, seq_len - (self.conv_kernel - 1), self.conv_kernel - 1)?);
+            self.conv_state = Some(causal_conv_state(&mixed, self.conv_kernel)?);
             out
         };
         let conv_out = self
@@ -482,6 +493,35 @@ mod tests {
     use candle::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::HashMap;
+
+    #[test]
+    fn cached_convolution_excludes_right_padding_and_preserves_short_history() {
+        let dev = Device::Cpu;
+        let x = Tensor::new(&[[[1f32, 2., 3., 4., 5.]]], &dev).unwrap();
+        let weight = Tensor::new(&[[[1f32, 2., 3., 4.]]], &dev).unwrap();
+        let expected = causal_conv1d(&x, &weight, 4, 1, 5, false).unwrap();
+        let first = x.narrow(2, 0, 1).unwrap();
+        let history = causal_conv_state(&first, 4).unwrap();
+        assert_eq!(
+            history.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [0., 0., 1.]
+        );
+        let continuation = x.narrow(2, 1, 4).unwrap();
+        let cached = Tensor::cat(&[&history, &continuation], 2).unwrap();
+        // Convolution adds kernel-1 outputs on the right. Slice by input
+        // length, not padded output length, to recover the causal rows.
+        let actual = causal_conv1d(&cached, &weight, 4, 1, 4, true).unwrap();
+        assert_eq!(
+            actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected
+                .narrow(2, 1, 4)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+    }
 
     /// A tiny, deterministic KDA config for reference-parity tests.
     struct TinyCfg {
