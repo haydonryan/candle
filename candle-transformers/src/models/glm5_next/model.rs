@@ -1090,6 +1090,19 @@ impl Glm5NextForCausalLM {
         self.lm_head.forward(&hidden)
     }
 
+    /// Forward returning both the final logits and the last hidden state, so a
+    /// caller can keep the hidden state for a downstream tower/head without a
+    /// second pass. `(logits, hidden)`.
+    pub fn forward_with_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.model.forward(input_ids, seqlen_offset)?;
+        let logits = self.lm_head.forward(&hidden)?;
+        Ok((logits, hidden))
+    }
+
     /// Multimodal forward: runs the vision tower on `pixel_values`/`grid_thw`,
     /// injects the resulting embeddings at the `image_token_id` positions, then
     /// runs the text transformer and `lm_head`. When no vision config is present
