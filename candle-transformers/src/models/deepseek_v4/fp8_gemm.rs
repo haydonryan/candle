@@ -136,6 +136,16 @@ pub struct BlasLt {
     stream: Arc<CudaStream>,
 }
 
+// SAFETY: `BlasLt` holds a raw cuBLASLt context handle (`*mut cublasLtContext`),
+// a `CudaSlice` workspace, and a `CudaStream`. The handle is a stable pointer
+// to a per-device context that may be used from any thread as long as calls are
+// not made concurrently. `BlasLt` is always stored behind a `RefCell` in
+// `Fp8Compute` (single-threaded borrow at a time), and its consumers drive it
+// through exclusive `&mut` access, so a `BlasLt` is never used from two threads
+// at once. Moving it to another thread (e.g. shipping a model to a decode task)
+// is therefore sound.
+unsafe impl Send for BlasLt {}
+
 impl BlasLt {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let handle =
