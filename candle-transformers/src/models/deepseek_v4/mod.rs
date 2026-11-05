@@ -10,7 +10,7 @@
 //! scaling).
 
 use crate::serde_default_fn;
-use candle::{DType, Device, Result, Tensor, D};
+use candle::{DType, Device, Error, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
