@@ -139,11 +139,12 @@ pub struct BlasLt {
 // SAFETY: `BlasLt` holds a raw cuBLASLt context handle (`*mut cublasLtContext`),
 // a `CudaSlice` workspace, and a `CudaStream`. The handle is a stable pointer
 // to a per-device context that may be used from any thread as long as calls are
-// not made concurrently. `BlasLt` is always stored behind a `RefCell` in
-// `Fp8Compute` (single-threaded borrow at a time), and its consumers drive it
-// through exclusive `&mut` access, so a `BlasLt` is never used from two threads
-// at once. Moving it to another thread (e.g. shipping a model to a decode task)
-// is therefore sound.
+// not made concurrently. `BlasLt` is stored behind a `std::sync::Mutex` in
+// `Fp8Compute`, and its consumers drive it through exclusive `&mut` access
+// (serialized by the mutex), so a `BlasLt` is never used from two threads at
+// once even when `&Fp8Compute` is shared across threads. Moving it to another
+// thread (e.g. shipping a model to a decode task) is therefore sound, and the
+// enclosing `Mutex` makes `Fp8Compute` `Sync`.
 unsafe impl Send for BlasLt {}
 
 impl BlasLt {

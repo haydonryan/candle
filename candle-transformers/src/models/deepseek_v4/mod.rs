@@ -19,11 +19,16 @@ use std::sync::Arc;
 pub mod fp8_gemm;
 
 /// Shared cuBLASLt handle used for the fp8-compute path (fp8 x fp8 GEMM with
-/// fp32 accumulation). Wrapped in `RefCell` so it can be borrowed mutably from
-/// `&self` methods (attention forward is `&mut self`, MoE forward is `&self`).
+/// fp32 accumulation). Wrapped in a `Mutex` so it can be borrowed mutably from
+/// `&self` methods (attention forward is `&mut self`, MoE forward is `&self`)
+/// and so `Fp8Compute` is `Sync`: the raw cuBLASLt handle is a stable per-device
+/// context that may be used from any thread as long as calls are serialized
+/// (one enqueued launch at a time). The mutex serializes concurrent `linear`
+/// launches; each enqueues onto its bound stream before releasing the lock, so
+/// per-stream ordering and fp8 numerics are unchanged.
 #[cfg(feature = "cuda")]
 struct Fp8Compute {
-    blas: std::cell::RefCell<fp8_gemm::BlasLt>,
+    blas: std::sync::Mutex<fp8_gemm::BlasLt>,
 }
 
 #[cfg(feature = "cuda")]
@@ -31,12 +36,16 @@ impl Fp8Compute {
     fn new(dev: &Device) -> Result<Self> {
         let stream = dev.as_cuda_device()?.cuda_stream();
         Ok(Self {
-            blas: std::cell::RefCell::new(fp8_gemm::BlasLt::new(stream)?),
+            blas: std::sync::Mutex::new(fp8_gemm::BlasLt::new(stream)?),
         })
     }
 
     fn linear(&self, act: &Tensor, w: &fp8_gemm::Fp8Weight, out_dtype: DType) -> Result<Tensor> {
-        fp8_gemm::fp8_linear(&mut self.blas.borrow_mut(), act, w, out_dtype)
+        let mut blas = self
+            .blas
+            .lock()
+            .map_err(|e| Error::msg(format!("fp8 blas lock poisoned: {e}")))?;
+        fp8_gemm::fp8_linear(&mut blas, act, w, out_dtype)
     }
 
     fn grouped_linear(
@@ -46,7 +55,11 @@ impl Fp8Compute {
         n_groups: usize,
         out_dtype: DType,
     ) -> Result<Tensor> {
-        fp8_gemm::fp8_grouped_linear(&mut self.blas.borrow_mut(), act, w, n_groups, out_dtype)
+        let mut blas = self
+            .blas
+            .lock()
+            .map_err(|e| Error::msg(format!("fp8 blas lock poisoned: {e}")))?;
+        fp8_gemm::fp8_grouped_linear(&mut blas, act, w, n_groups, out_dtype)
     }
 }
 
