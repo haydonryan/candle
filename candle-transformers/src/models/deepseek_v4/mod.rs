@@ -879,6 +879,32 @@ impl DeepseekV4Attention {
         }
     }
 
+    /// Capture the attention's mutable state (sliding-window KV cache, its fp8
+    /// scale, and the compressor's buffer/carry state) for bounded rollback.
+    /// Tensor handles are Arc-backed, so the snapshot shares the live buffers'
+    /// physical bytes rather than copying them.
+    pub fn snapshot_state(&self) -> DeepseekV4AttnState {
+        DeepseekV4AttnState {
+            kv_cache: self.kv_cache.clone(),
+            kv_cache_scale: self.kv_cache_scale.clone(),
+            compressor: self.compressor.as_ref().map(|c| c.snapshot_state()),
+        }
+    }
+
+    /// Restore the attention's mutable state from a snapshot captured by
+    /// [`Self::snapshot_state`]. The compressor is only restored when both the
+    /// live layer and the snapshot carry one (layer schedules are fixed by the
+    /// config, so a valid snapshot always matches).
+    pub fn restore_state(&mut self, snap: &DeepseekV4AttnState) {
+        self.kv_cache = snap.kv_cache.clone();
+        self.kv_cache_scale = snap.kv_cache_scale.clone();
+        if let Some(c) = &mut self.compressor {
+            if let Some(cs) = &snap.compressor {
+                c.restore_state(cs);
+            }
+        }
+    }
+
     /// Query-A projection: fp8-compute when enabled, eager matmul otherwise.
     fn q_a_apply(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
@@ -1253,6 +1279,11 @@ fn running_compressed_kv(
     }
 }
 
+/// Byte size of a tensor's backing storage (element count x element size).
+fn dsv4_tensor_bytes(t: &Tensor) -> u64 {
+    (t.elem_count() as u64).saturating_mul(t.dtype().size_in_bytes() as u64)
+}
+
 impl Default for CsaCompressionState {
     fn default() -> Self {
         Self::new()
@@ -1274,6 +1305,27 @@ impl CsaCompressionState {
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
     fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
         running_compressed_kv(&self.compressed_kv, device, head_dim, dtype)
+    }
+
+    /// Total bytes retained by this compression state's live tensors (window
+    /// buffer, running compressed KV, and the cross-call overlap carry). Used
+    /// to admit a bounded-rollback snapshot into the verification workspace
+    /// budget. Tensor handles are Arc-backed copies, so this is the physical
+    /// byte footprint shared with the live state.
+    pub fn retained_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for t in [
+            &self.buffer_kv,
+            &self.buffer_gate,
+            &self.compressed_kv,
+            &self.overlap_kv,
+            &self.overlap_gate,
+        ] {
+            if let Some(t) = t {
+                bytes += dsv4_tensor_bytes(t);
+            }
+        }
+        bytes
     }
 
     /// `store_compression_weights`: fold new projections into the buffer, peel
@@ -1730,6 +1782,40 @@ impl DeepseekV4Compressor {
         }
     }
 
+    /// Capture the compressor's evolving buffer/carry state for bounded
+    /// rollback. Tensor handles are Arc-backed, so this is a cheap copy of the
+    /// live buffers (shared physical bytes).
+    pub fn snapshot_state(&self) -> DeepseekV4CompressorState {
+        match self {
+            Self::Csa(c) => DeepseekV4CompressorState::Csa {
+                state: c.state.clone(),
+                indexer: c.indexer.state.clone(),
+            },
+            Self::Hca(c) => DeepseekV4CompressorState::Hca {
+                state: c.state.clone(),
+            },
+        }
+    }
+
+    /// Restore the compressor's buffer/carry state from a snapshot captured by
+    /// [`Self::snapshot_state`]. A layer-type mismatch is a no-op (the caller
+    /// guards layer schedules, so this only ever matches a valid snapshot).
+    pub fn restore_state(&mut self, snap: &DeepseekV4CompressorState) {
+        match (self, snap) {
+            (
+                Self::Csa(c),
+                DeepseekV4CompressorState::Csa { state, indexer },
+            ) => {
+                c.state = state.clone();
+                c.indexer.state = indexer.clone();
+            }
+            (Self::Hca(c), DeepseekV4CompressorState::Hca { state }) => {
+                c.state = state.clone();
+            }
+            _ => {}
+        }
+    }
+
     pub fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -1743,10 +1829,74 @@ impl DeepseekV4Compressor {
     }
 }
 
+/// A snapshot of a compressor's evolving buffer/carry state (window buffer,
+/// running compressed KV, cross-call overlap carry, and the Lightning Indexer
+/// state for CSA layers), captured so a rejected speculative draft can restore
+/// the compressor to the accept point. Private variant fields hold the state
+/// clones; consumers only pass it back to [`DeepseekV4Compressor::restore_state`]
+/// and read [`Self::retained_bytes`] for byte admission.
+#[derive(Clone)]
+pub enum DeepseekV4CompressorState {
+    /// CSA: the compressor's own overlap/buffer state plus the indexer's
+    /// independent compression state.
+    Csa {
+        state: CsaCompressionState,
+        indexer: CsaCompressionState,
+    },
+    /// HCA: the compressor's own buffer/running-KV state (no indexer).
+    Hca { state: HcaCompressionState },
+}
+
+impl DeepseekV4CompressorState {
+    /// Total retained tensor bytes across this compressor's state clones.
+    pub fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Csa { state, indexer } => state.retained_bytes() + indexer.retained_bytes(),
+            Self::Hca { state } => state.retained_bytes(),
+        }
+    }
+}
+
+/// A snapshot of a `DeepseekV4Attention`'s mutable state at an accept point,
+/// captured by [`DeepseekV4Attention::snapshot_state`] for bounded rollback of
+/// a rejected speculative draft. Holds the sliding-window KV cache, its fp8
+/// scale, and the compressor's buffer/carry state. Private fields; consumers
+/// pass it back to [`DeepseekV4Attention::restore_state`] and read
+/// [`Self::retained_bytes`] for byte admission.
+#[derive(Clone)]
+pub struct DeepseekV4AttnState {
+    kv_cache: Option<Tensor>,
+    kv_cache_scale: Option<Tensor>,
+    compressor: Option<DeepseekV4CompressorState>,
+}
+
+impl DeepseekV4AttnState {
+    /// Total retained tensor bytes across this snapshot's live state (sliding
+    /// KV cache + fp8 scale + compressor buffers). The snapshot shares the live
+    /// buffers' physical bytes (Arc-backed handles), so this is the footprint
+    /// that must be admitted to the verification workspace budget for bounded
+    /// rollback.
+    pub fn retained_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        if let Some(t) = &self.kv_cache {
+            bytes += dsv4_tensor_bytes(t);
+        }
+        if let Some(t) = &self.kv_cache_scale {
+            bytes += dsv4_tensor_bytes(t);
+        }
+        if let Some(c) = &self.compressor {
+            bytes += c.retained_bytes();
+        }
+        bytes
+    }
+}
+
 /// HCA compression state: buffered source projections, the running list of
-/// emitted compressed entries, and the total window count.
+/// emitted compressed entries, and the total window count. Public so the
+/// bounded-rollback snapshot type ([`DeepseekV4CompressorState`]) can hold it;
+/// its fields stay private.
 #[derive(Default, Clone, Debug)]
-struct HcaCompressionState {
+pub struct HcaCompressionState {
     buffer_kv: Option<Tensor>,
     buffer_gate: Option<Tensor>,
     compressed_kv: Option<Tensor>,
@@ -1754,6 +1904,19 @@ struct HcaCompressionState {
 }
 
 impl HcaCompressionState {
+    /// Total bytes retained by this compression state's live tensors (window
+    /// buffer and running compressed KV), used for bounded-rollback snapshot
+    /// byte admission.
+    pub fn retained_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for t in [&self.buffer_kv, &self.buffer_gate, &self.compressed_kv] {
+            if let Some(t) = t {
+                bytes += dsv4_tensor_bytes(t);
+            }
+        }
+        bytes
+    }
+
     /// Running compressed KV `[B, T, head_dim]`, or empty `[B, 0, head_dim]`.
     fn running_compressed(&self, device: &Device, head_dim: usize, dtype: DType) -> Result<Tensor> {
         running_compressed_kv(&self.compressed_kv, device, head_dim, dtype)
